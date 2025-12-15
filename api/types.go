@@ -266,9 +266,10 @@ type ToolCall struct {
 }
 
 type ToolResult struct {
-	ToolName string `json:"tool_name"`
-	Content  string `json:"content"`
-	Error    string `json:"error,omitempty"`
+	ToolName  string                    `json:"tool_name"`
+	Arguments ToolCallFunctionArguments `json:"arguments,omitempty"`
+	Content   string                    `json:"content"`
+	Error     string                    `json:"error,omitempty"`
 }
 
 type ToolCallFunction struct {
@@ -1003,9 +1004,6 @@ type GenerateResponse struct {
 	Context []int `json:"context,omitempty"`
 
 	Metrics
-
-	ToolCalls   []ToolCall   `json:"tool_calls,omitempty"`
-	ToolResults []ToolResult `json:"tool_results,omitempty"`
 
 	DebugInfo *DebugInfo `json:"_debug_info,omitempty"`
 

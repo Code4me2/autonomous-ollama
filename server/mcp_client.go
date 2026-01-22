@@ -368,7 +368,7 @@ func (c *MCPClient) ListTools() ([]api.Tool, error) {
 				Description: mcpTool.Description,
 				Parameters: api.ToolFunctionParameters{
 					Type:       "object",
-					Properties: make(map[string]api.ToolProperty),
+					Properties: api.NewToolPropertiesMap(),
 					Required:   []string{},
 				},
 			},
@@ -397,7 +397,7 @@ func (c *MCPClient) ListTools() ([]api.Tool, error) {
 					toolProp.Items = items
 				}
 
-				tool.Function.Parameters.Properties[propName] = toolProp
+				tool.Function.Parameters.Properties.Set(propName, toolProp)
 			}
 		} else if mcpTool.InputSchema["properties"] != nil {
 			slog.Debug("MCP schema: properties not a map", "tool", mcpTool.Name)

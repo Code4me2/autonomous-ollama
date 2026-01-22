@@ -152,7 +152,7 @@ func (m *MCPManager) ExecuteTool(toolCall api.ToolCall) ToolResult {
 
 	// Convert arguments to map[string]interface{}
 	args := make(map[string]interface{})
-	for k, v := range toolCall.Function.Arguments {
+	for k, v := range toolCall.Function.Arguments.All() {
 		args[k] = v
 	}
 
@@ -194,27 +194,27 @@ func (m *MCPManager) AnalyzeExecutionPlan(toolCalls []api.ToolCall) ExecutionPla
 			hasWriteOperations = true
 			
 			// Try to extract file path from arguments
-			if pathArg, exists := args["path"]; exists {
+			if pathArg, exists := args.Get("path"); exists {
 				if path, ok := pathArg.(string); ok {
 					fileTargets[path] = append(fileTargets[path], i)
 				}
-			} else if fileArg, exists := args["file"]; exists {
+			} else if fileArg, exists := args.Get("file"); exists {
 				if file, ok := fileArg.(string); ok {
 					fileTargets[file] = append(fileTargets[file], i)
 				}
 			}
 		}
-		
+
 		if strings.Contains(toolName, "read") || strings.Contains(toolName, "list") ||
 		   strings.Contains(toolName, "get") {
 			hasReadOperations = true
-			
+
 			// Try to extract file path from arguments
-			if pathArg, exists := args["path"]; exists {
+			if pathArg, exists := args.Get("path"); exists {
 				if path, ok := pathArg.(string); ok {
 					fileTargets[path] = append(fileTargets[path], i)
 				}
-			} else if fileArg, exists := args["file"]; exists {
+			} else if fileArg, exists := args.Get("file"); exists {
 				if file, ok := fileArg.(string); ok {
 					fileTargets[file] = append(fileTargets[file], i)
 				}

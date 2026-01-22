@@ -2529,16 +2529,17 @@ func renderToolCalls(toolCalls []api.ToolCall, plainText bool) string {
 		}
 		// Format arguments in a more readable way
 		var argsDisplay string
-		// Arguments is already a map[string]any
+		// Convert Arguments to map for display
+		argsMap := toolCall.Function.Arguments.ToMap()
 		// Sort keys for deterministic display order
-		keys := make([]string, 0, len(toolCall.Function.Arguments))
-		for k := range toolCall.Function.Arguments {
+		keys := make([]string, 0, len(argsMap))
+		for k := range argsMap {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		var pairs []string
 		for _, k := range keys {
-			pairs = append(pairs, fmt.Sprintf("%s: %v", k, toolCall.Function.Arguments[k]))
+			pairs = append(pairs, fmt.Sprintf("%s: %v", k, argsMap[k]))
 		}
 		if len(pairs) > 0 {
 			argsDisplay = strings.Join(pairs, ", ")

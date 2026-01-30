@@ -181,10 +181,24 @@ With this configuration:
       "env": {"KEY": "value"}
     }
   ],
+  "stream": false,
   "max_tool_rounds": 10,
-  "tool_timeout": 30000
+  "tool_timeout": 30000,
+  "include_tool_results": true
 }
 ```
+
+**Request Parameters:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `model` | string | required | Model to use for generation |
+| `messages` | []Message | required | Conversation history |
+| `mcp_servers` | []MCPServer | - | MCP servers to enable for tool execution |
+| `stream` | bool | true | Stream responses (set `false` for single response with tool loop) |
+| `max_tool_rounds` | int | 15 | Maximum tool execution rounds before stopping |
+| `tool_timeout` | int | 30000 | Timeout per tool execution in milliseconds |
+| `include_tool_results` | bool | false | Include raw tool output in response |
 
 **MCP Server Configuration:**
 
@@ -194,6 +208,67 @@ With this configuration:
 | `command` | string | Executable to run |
 | `args` | []string | Command-line arguments |
 | `env` | map | Environment variables |
+
+### Response Format
+
+**Non-streaming response** (`stream: false`):
+```json
+{
+  "model": "qwen2.5:7b",
+  "created_at": "2024-01-15T10:30:00Z",
+  "message": {
+    "role": "assistant",
+    "content": "Here are the files in the directory...",
+    "tool_calls": [
+      {
+        "function": {
+          "name": "filesystem:list_directory",
+          "arguments": {"path": "/home/user"}
+        }
+      }
+    ]
+  },
+  "tool_results": [
+    {
+      "tool_name": "filesystem:list_directory",
+      "arguments": {"path": "/home/user"},
+      "content": "[DIR] Documents\n[DIR] Downloads\n[FILE] readme.txt"
+    }
+  ],
+  "done": true,
+  "done_reason": "stop"
+}
+```
+
+> **Note:** `tool_results` is only included when `include_tool_results: true` in the request.
+
+### Complete Example
+
+```bash
+# Multi-step task with tool results included
+curl -X POST http://localhost:11434/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen2.5:7b",
+    "messages": [
+      {"role": "user", "content": "List the files in /tmp and read any .txt files you find"}
+    ],
+    "mcp_servers": [{
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }],
+    "stream": false,
+    "include_tool_results": true,
+    "max_tool_rounds": 5
+  }'
+```
+
+The model will autonomously:
+1. Call `filesystem:list_directory` to list files
+2. Identify `.txt` files from the results
+3. Call `filesystem:read_file` for each text file
+4. Return a synthesized response with all findings
 
 ### Server Definition Fields
 

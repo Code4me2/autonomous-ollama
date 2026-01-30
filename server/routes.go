@@ -2591,16 +2591,8 @@ func (s *Server) ChatHandler(c *gin.Context) {
 					"valid_tools", validToolCalls,
 					"round", round)
 
-				// Send tool calls to client for display BEFORE executing
-				// This ensures the client can show "Executing tool..." for all rounds
-				// Note: Don't include Content here - it was already streamed during completion
-				ch <- api.ChatResponse{
-					Model: req.Model,
-					Message: api.Message{
-						Role:      "assistant",
-						ToolCalls: completionResult.ToolCalls,
-					},
-				}
+				// Note: Tool calls were already streamed to client during executeCompletionWithTools
+				// No need to re-send them here - that was causing duplicates in the response
 
 				// Analyze execution plan
 				executionPlan := mcpManager.AnalyzeExecutionPlan(completionResult.ToolCalls)
@@ -2714,6 +2706,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	if req.Stream != nil && !*req.Stream {
 		var resp api.ChatResponse
 		var toolCalls []api.ToolCall
+		var toolResults []api.ToolResult
 		var allLogprobs []api.Logprob
 		var sbThinking strings.Builder
 		var sbContent strings.Builder
@@ -2723,8 +2716,10 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				sbThinking.WriteString(t.Message.Thinking)
 				sbContent.WriteString(t.Message.Content)
 				resp = t
-				if len(req.Tools) > 0 {
+				if len(req.Tools) > 0 || len(req.MCPServers) > 0 {
 					toolCalls = append(toolCalls, t.Message.ToolCalls...)
+					// Accumulate tool results for include_tool_results option
+					toolResults = append(toolResults, t.Message.ToolResults...)
 				}
 				// Accumulate logprobs from all chunks for non-streaming response
 				if len(t.Logprobs) > 0 {
@@ -2748,6 +2743,10 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 		if len(toolCalls) > 0 {
 			resp.Message.ToolCalls = toolCalls
+		}
+		// Include tool results in response if requested
+		if req.IncludeToolResults && len(toolResults) > 0 {
+			resp.ToolResults = toolResults
 		}
 		c.JSON(http.StatusOK, resp)
 	} else {

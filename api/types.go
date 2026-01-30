@@ -207,6 +207,11 @@ type ChatRequest struct {
 	// infinite loops. Defaults to 15 if not specified.
 	MaxToolRounds int `json:"max_tool_rounds,omitempty"`
 
+	// IncludeToolResults, when true, includes raw tool execution results
+	// in the final response. Useful for debugging or when clients need
+	// to see exactly what tools returned.
+	IncludeToolResults bool `json:"include_tool_results,omitempty"`
+
 	// ToolTimeout sets the timeout for individual tool executions.
 	// Defaults to 30 seconds if not specified.
 	ToolTimeout *Duration `json:"tool_timeout,omitempty"`
@@ -695,6 +700,10 @@ type ChatResponse struct {
 	// Logprobs contains log probability information for the generated tokens,
 	// if requested via the Logprobs parameter.
 	Logprobs []Logprob `json:"logprobs,omitempty"`
+
+	// ToolResults contains the raw results from MCP tool executions,
+	// only included when IncludeToolResults is true in the request.
+	ToolResults []ToolResult `json:"tool_results,omitempty"`
 
 	Metrics
 }

@@ -19,8 +19,10 @@ import (
 type qwenParserState int
 
 const (
-	toolOpenTag  = "<tool_call>"
-	toolCloseTag = "</tool_call>"
+	toolOpenTag      = "<tool_call>"
+	toolCloseTag     = "</tool_call>"
+	functionOpenTag  = "<function="  // Fallback: some models omit <tool_call> wrapper
+	functionCloseTag = "</function>"
 )
 
 const (
@@ -124,6 +126,7 @@ func eat(p *Qwen3CoderParser) ([]qwenEvent, bool) {
 
 	switch p.state {
 	case qwenParserState_LookingForToolStart:
+		// Check for standard <tool_call> wrapper
 		if strings.Contains(p.acc.String(), toolOpenTag) {
 			// we found a full tool open tag, so we can emit the content before the
 			// tag, being sure to trim any trailing whitespace
@@ -138,10 +141,37 @@ func eat(p *Qwen3CoderParser) ([]qwenEvent, bool) {
 			p.acc.WriteString(after)
 			p.state = qwenParserState_CollectingToolContent
 			return events, true
+		} else if strings.Contains(p.acc.String(), functionOpenTag) {
+			// Fallback: model omitted <tool_call> wrapper, look for bare <function=...>
+			// This handles cases where the model directly outputs function calls
+			idx := strings.Index(p.acc.String(), functionOpenTag)
+			before := p.acc.String()[:idx]
+			before = strings.TrimRightFunc(before, unicode.IsSpace)
+			if len(before) > 0 {
+				events = append(events, qwenEventContent{content: before})
+			}
+			after := p.acc.String()[idx:]
+			p.acc.Reset()
+			p.acc.WriteString(after)
+			p.state = qwenParserState_CollectingToolContent
+			return events, true
 		} else if overlap := overlap(p.acc.String(), toolOpenTag); overlap > 0 {
 			// we found a partial tool open tag, so we can emit the unambiguous part,
 			// which is the (trailing-whitespace trimmed) content before the partial
 			// tool open tag
+			beforePartialTag := p.acc.String()[:len(p.acc.String())-overlap]
+			trailingWhitespaceLen := trailingWhitespaceLen(beforePartialTag)
+			ambiguousStart := len(beforePartialTag) - trailingWhitespaceLen
+			unambiguous := p.acc.String()[:ambiguousStart]
+			ambiguous := p.acc.String()[ambiguousStart:]
+			p.acc.Reset()
+			p.acc.WriteString(ambiguous)
+			if len(unambiguous) > 0 {
+				events = append(events, qwenEventContent{content: unambiguous})
+			}
+			return events, false
+		} else if overlap := overlap(p.acc.String(), functionOpenTag); overlap > 0 {
+			// Same handling for partial <function= tag
 			beforePartialTag := p.acc.String()[:len(p.acc.String())-overlap]
 			trailingWhitespaceLen := trailingWhitespaceLen(beforePartialTag)
 			ambiguousStart := len(beforePartialTag) - trailingWhitespaceLen
@@ -168,6 +198,7 @@ func eat(p *Qwen3CoderParser) ([]qwenEvent, bool) {
 			return events, false
 		}
 	case qwenParserState_CollectingToolContent:
+		// Check for </tool_call> first (standard wrapper)
 		if strings.Contains(p.acc.String(), toolCloseTag) {
 			split := strings.SplitN(p.acc.String(), toolCloseTag, 2)
 			before := split[0]
@@ -178,6 +209,24 @@ func eat(p *Qwen3CoderParser) ([]qwenEvent, bool) {
 			after := strings.TrimLeftFunc(split[1], unicode.IsSpace)
 			p.acc.Reset()
 			p.acc.WriteString(after)
+			events = append(events, qwenEventRawToolCall{raw: before})
+			p.state = qwenParserState_LookingForToolStart
+			return events, true
+		} else if strings.Contains(p.acc.String(), functionCloseTag) {
+			// Fallback: handle bare </function> without </tool_call> wrapper
+			// Extract just the function content
+			split := strings.SplitN(p.acc.String(), functionCloseTag, 2)
+			before := split[0] + functionCloseTag // Include the closing tag for parsing
+			// Check for trailing </tool_call> and skip it
+			after := split[1]
+			after = strings.TrimLeftFunc(after, unicode.IsSpace)
+			if strings.HasPrefix(after, toolCloseTag) {
+				after = strings.TrimPrefix(after, toolCloseTag)
+				after = strings.TrimLeftFunc(after, unicode.IsSpace)
+			}
+			p.acc.Reset()
+			p.acc.WriteString(after)
+			// The raw content includes <function=...>...</function>
 			events = append(events, qwenEventRawToolCall{raw: before})
 			p.state = qwenParserState_LookingForToolStart
 			return events, true

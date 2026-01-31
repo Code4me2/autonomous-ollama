@@ -199,6 +199,9 @@ With this configuration:
 | `max_tool_rounds` | int | 15 | Maximum tool execution rounds before stopping |
 | `tool_timeout` | int | 30000 | Timeout per tool execution in milliseconds |
 | `include_tool_results` | bool | false | Include raw tool output in response |
+| `jit_tools` | bool | true | Enable JIT tool discovery (see below) |
+| `jit_max_tools` | int | 5 | Max tools injected per discovery call |
+| `jit_connect_eager` | bool | false | Pre-connect servers for faster discovery |
 
 **MCP Server Configuration:**
 
@@ -284,6 +287,110 @@ The model will autonomously:
 | `capabilities` | []string | List of capability tags |
 | `auto_enable` | string | Auto-enable mode (never/always/with_path/if_match) |
 | `enable_if` | object | Conditions for if_match mode |
+
+## JIT Tool Discovery (Default)
+
+Ollama uses Just-In-Time (JIT) tool discovery by default for API requests. Instead of loading all tools upfront (which can consume significant context), the model starts with only an `mcp_discover` meta-tool and finds tools as needed.
+
+### Why JIT?
+
+| Aspect | Eager Loading | JIT Discovery |
+|--------|--------------|---------------|
+| Initial context | 500-5000 tokens (all tools) | ~50 tokens (mcp_discover only) |
+| Startup time | Slow (connect all servers) | Fast (no connections until needed) |
+| Scalability | Limited by context window | Unlimited registered tools |
+| Model guidance | Must know all tools upfront | Discovers what it needs |
+
+### How It Works
+
+1. **Request arrives** with `mcp_servers` config
+2. **Model receives** only the `mcp_discover` tool
+3. **Model decides** it needs file tools, calls `mcp_discover("*file*")`
+4. **Ollama connects** to relevant MCP server (lazy connection)
+5. **Matching tools injected** (e.g., `filesystem:read_file`, `filesystem:write_file`)
+6. **Model uses** the discovered tools
+7. **Loop continues** - model can discover more tools if needed
+
+### Discovery Patterns
+
+The `mcp_discover` tool accepts glob patterns:
+
+| Pattern | Matches |
+|---------|---------|
+| `*file*` | `filesystem:read_file`, `filesystem:write_file`, ... |
+| `*git*` | `git:status`, `git:commit`, `git:diff`, ... |
+| `*sql*` | `postgres:query`, `mysql:execute`, ... |
+| `*search*` | `filesystem:search_files`, `github:search`, ... |
+| `*` | All available tools (use sparingly) |
+
+### API Example
+
+JIT is enabled by default. The model automatically discovers tools:
+
+```bash
+curl -X POST http://localhost:11434/api/chat \
+  -d '{
+    "model": "qwen2.5:7b",
+    "messages": [{"role": "user", "content": "Read the config file and fix the bug"}],
+    "mcp_servers": [{
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/project"]
+    }],
+    "stream": false
+  }'
+```
+
+The model will:
+1. Receive `mcp_discover` tool
+2. Call `mcp_discover("*file*")` or `mcp_discover("*read*")`
+3. Get `filesystem:read_file` injected
+4. Read the config file
+5. Continue working...
+
+### Disabling JIT (Legacy Mode)
+
+To load all tools upfront (not recommended for large tool sets):
+
+```json
+{
+  "jit_tools": false,
+  "mcp_servers": [...]
+}
+```
+
+### Programmatic Tool Search
+
+Search for tools without a chat request using the `/api/tools/search` endpoint:
+
+```bash
+curl -X POST http://localhost:11434/api/tools/search \
+  -d '{
+    "pattern": "*file*",
+    "mcp_servers": [{
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }]
+  }'
+```
+
+**Response:**
+```json
+{
+  "tools": [
+    {
+      "server": "filesystem",
+      "name": "filesystem:read_file",
+      "description": "Read the contents of a file",
+      "parameters": {...}
+    },
+    ...
+  ],
+  "pattern": "*file*",
+  "total": 5
+}
+```
 
 ## Security
 

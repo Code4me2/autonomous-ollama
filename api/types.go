@@ -212,6 +212,20 @@ type ChatRequest struct {
 	// to see exactly what tools returned.
 	IncludeToolResults bool `json:"include_tool_results,omitempty"`
 
+	// JITTools enables just-in-time tool discovery mode.
+	// DEFAULT: true - Model starts with only mcp_discover and finds tools as needed.
+	// Set to false to load all tools upfront (legacy behavior).
+	JITTools *bool `json:"jit_tools,omitempty"`
+
+	// JITMaxTools limits tools injected per discovery call (default: 5).
+	// Prevents context overflow from overly broad searches.
+	JITMaxTools int `json:"jit_max_tools,omitempty"`
+
+	// JITConnectEager, when true, connects to MCP servers immediately
+	// but still uses JIT discovery for tool injection.
+	// Useful when server startup is slow and you want to parallelize.
+	JITConnectEager bool `json:"jit_connect_eager,omitempty"`
+
 	// ToolTimeout sets the timeout for individual tool executions.
 	// Defaults to 30 seconds if not specified.
 	ToolTimeout *Duration `json:"tool_timeout,omitempty"`

@@ -15,6 +15,10 @@ type MCPManager struct {
 	clients     map[string]*MCPClient
 	toolRouting map[string]string // tool name -> client name mapping
 	maxClients  int
+
+	// Lazy connection support for JIT mode
+	pendingConfigs map[string]api.MCPServerConfig
+	lazyMode       bool
 }
 
 // MCPServerConfig is imported from api package
@@ -35,10 +39,118 @@ type ExecutionPlan struct {
 // NewMCPManager creates a new MCP manager
 func NewMCPManager(maxClients int) *MCPManager {
 	return &MCPManager{
-		clients:     make(map[string]*MCPClient),
-		toolRouting: make(map[string]string),
-		maxClients:  maxClients,
+		clients:        make(map[string]*MCPClient),
+		toolRouting:    make(map[string]string),
+		pendingConfigs: make(map[string]api.MCPServerConfig),
+		maxClients:     maxClients,
+		lazyMode:       false,
 	}
+}
+
+// NewMCPManagerLazy creates a manager that defers server connections
+func NewMCPManagerLazy(maxClients int) *MCPManager {
+	return &MCPManager{
+		clients:        make(map[string]*MCPClient),
+		toolRouting:    make(map[string]string),
+		pendingConfigs: make(map[string]api.MCPServerConfig),
+		maxClients:     maxClients,
+		lazyMode:       true,
+	}
+}
+
+// AddServerLazy stores config for later connection (JIT mode)
+func (m *MCPManager) AddServerLazy(config api.MCPServerConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(m.clients)+len(m.pendingConfigs) >= m.maxClients {
+		return fmt.Errorf("maximum number of MCP servers reached (%d)", m.maxClients)
+	}
+
+	// Validate config before storing
+	if err := m.validateServerConfig(config); err != nil {
+		return fmt.Errorf("invalid MCP server configuration: %w", err)
+	}
+
+	m.pendingConfigs[config.Name] = config
+	slog.Debug("MCP server registered for lazy connection", "name", config.Name)
+	return nil
+}
+
+// EnsureConnected connects to a server if not already connected
+func (m *MCPManager) EnsureConnected(serverName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Already connected?
+	if _, exists := m.clients[serverName]; exists {
+		return nil
+	}
+
+	// Get pending config
+	config, exists := m.pendingConfigs[serverName]
+	if !exists {
+		return fmt.Errorf("server '%s' not configured", serverName)
+	}
+
+	// Connect now
+	client := NewMCPClient(config.Name, config.Command, config.Args, config.Env)
+	if err := client.Initialize(); err != nil {
+		client.Close()
+		return fmt.Errorf("failed to initialize: %w", err)
+	}
+
+	// Discover and register tools
+	tools, err := client.ListTools()
+	if err != nil {
+		client.Close()
+		return fmt.Errorf("failed to list tools: %w", err)
+	}
+
+	for _, tool := range tools {
+		m.toolRouting[tool.Function.Name] = serverName
+	}
+
+	m.clients[serverName] = client
+	delete(m.pendingConfigs, serverName) // No longer pending
+
+	slog.Info("Lazy-connected to MCP server", "name", serverName, "tools", len(tools))
+	return nil
+}
+
+// GetToolsFromServer returns tools from a specific server
+func (m *MCPManager) GetToolsFromServer(serverName string) ([]api.Tool, error) {
+	m.mu.RLock()
+	client, exists := m.clients[serverName]
+	m.mu.RUnlock()
+
+	if !exists {
+		// Try to connect if pending
+		if err := m.EnsureConnected(serverName); err != nil {
+			return nil, err
+		}
+		m.mu.RLock()
+		client = m.clients[serverName]
+		m.mu.RUnlock()
+	}
+
+	if client == nil {
+		return nil, fmt.Errorf("server '%s' not found", serverName)
+	}
+
+	return client.ListTools()
+}
+
+// IsLazyMode returns whether the manager is in lazy connection mode
+func (m *MCPManager) IsLazyMode() bool {
+	return m.lazyMode
+}
+
+// GetPendingServerCount returns the number of servers awaiting connection
+func (m *MCPManager) GetPendingServerCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.pendingConfigs)
 }
 
 // AddServer adds a new MCP server to the manager

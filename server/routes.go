@@ -1590,6 +1590,7 @@ func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
 	// MCP Tools discovery
 	r.GET("/api/tools", s.ToolsHandler)
 	r.POST("/api/tools", s.ToolsHandler)
+	r.POST("/api/tools/search", s.ToolSearchHandler)
 
 	r.POST("/api/me", s.WhoamiHandler)
 
@@ -2337,6 +2338,17 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	// =========================================================================
 
 	var mcpManager *MCPManager
+	var jitState *JITState
+
+	// Determine if JIT mode is enabled (default: true for API requests with mcp_servers)
+	jitEnabled := true
+	if req.JITTools != nil {
+		jitEnabled = *req.JITTools
+	}
+	// Disable JIT for path-based mode (CLI) to maintain backward compatibility
+	if req.ToolsPath != "" {
+		jitEnabled = false
+	}
 
 	if len(req.MCPServers) > 0 || req.ToolsPath != "" {
 		if req.ToolsPath != "" {
@@ -2349,45 +2361,76 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				// Continue without MCP - graceful degradation
 			}
 		} else if len(req.MCPServers) > 0 {
-			// Explicit mode: use server configs from API request
-			// Used by API: POST /api/chat with mcp_servers field
-			sessionID := GenerateSessionID(req)
-			slog.Debug("Getting MCP manager", "session", sessionID, "servers", len(req.MCPServers))
-			mcpManager, err = GetMCPManager(sessionID, req.MCPServers)
-			if err != nil {
-				slog.Error("Failed to get MCP manager", "error", err)
-				// Continue without MCP - graceful degradation
+			if jitEnabled {
+				// JIT MODE: Initialize state with pending servers
+				jitState = NewJITState(req.JITMaxTools)
+				mcpManager = NewMCPManagerLazy(10)
+
+				for _, serverConfig := range req.MCPServers {
+					jitState.AddPendingServer(serverConfig)
+					if req.JITConnectEager {
+						// Pre-connect servers in eager mode
+						if err := mcpManager.AddServer(serverConfig); err != nil {
+							slog.Warn("JIT: Failed to pre-connect MCP server", "name", serverConfig.Name, "error", err)
+						}
+					} else {
+						// Register for lazy connection
+						if err := mcpManager.AddServerLazy(serverConfig); err != nil {
+							slog.Warn("JIT: Failed to register MCP server", "name", serverConfig.Name, "error", err)
+						}
+					}
+				}
+
+				slog.Info("JIT tools mode enabled",
+					"pending_servers", jitState.GetPendingServerCount(),
+					"max_tools_per_discovery", jitState.MaxToolsPerDiscovery,
+					"eager_connect", req.JITConnectEager)
+			} else {
+				// LEGACY MODE: Connect all servers and load all tools upfront
+				sessionID := GenerateSessionID(req)
+				slog.Debug("Getting MCP manager (legacy mode)", "session", sessionID, "servers", len(req.MCPServers))
+				mcpManager, err = GetMCPManager(sessionID, req.MCPServers)
+				if err != nil {
+					slog.Error("Failed to get MCP manager", "error", err)
+					// Continue without MCP - graceful degradation
+				}
 			}
 		}
 
 		if mcpManager != nil {
-			// Step 1: Discover tools from MCP servers and add to request
-			mcpTools := mcpManager.GetAllTools()
-			req.Tools = append(req.Tools, mcpTools...)
+			if jitEnabled && jitState != nil {
+				// JIT MODE: Start with only mcp_discover tool
+				req.Tools = append(req.Tools, MCPDiscoverTool)
+				slog.Debug("JIT: Starting with mcp_discover tool only")
+			} else {
+				// LEGACY MODE: Load all tools upfront
+				mcpTools := mcpManager.GetAllTools()
+				req.Tools = append(req.Tools, mcpTools...)
 
-			// Step 2: Inject context to help model use tools effectively
-			// Use programmatic context injection from tool schemas
-			codeAPI := NewMCPCodeAPI(mcpManager)
-			req.Messages = codeAPI.InjectContextIntoMessages(req.Messages, req.MCPServers)
+				// Inject context to help model use tools effectively
+				codeAPI := NewMCPCodeAPI(mcpManager)
+				req.Messages = codeAPI.InjectContextIntoMessages(req.Messages, req.MCPServers)
+			}
 
-			// Step 3: Auto-configure parser for tool call detection
+			// Auto-configure parser for tool call detection
 			if len(req.Tools) > 0 && m.Config.Parser == "" {
 				if m.Config.ModelFamily == "qwen2" || m.Config.ModelFamily == "qwen3" {
 					m.Config.Parser = "qwen3-vl-instruct"
 				}
 			}
 
-			// Step 4: Update capabilities now that we have tools
+			// Update capabilities now that we have tools
 			if len(req.Tools) > 0 && !slices.Contains(caps, model.CapabilityTools) {
 				caps = append(caps, model.CapabilityTools)
 			}
 		}
 
 		// Cleanup: Close MCP manager when request completes
-		// Note: Session manager may cache for reuse within TTL
 		defer func() {
-			if err := mcpManager.Close(); err != nil {
-				slog.Warn("Error closing MCP manager", "error", err)
+			if mcpManager != nil {
+				if err := mcpManager.Close(); err != nil {
+					slog.Warn("Error closing MCP manager", "error", err)
+				}
 			}
 		}()
 	}
@@ -2508,25 +2551,43 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		// MAIN LOOP - Multi-round execution for tool calling
 		var round int
 		for round = 0; round < maxRounds; round++ {
-			slog.Debug("Starting round", "round", round, "messages", len(currentMsgs))
+			slog.Debug("Starting tool round", "round", round, "messages", len(currentMsgs), "tools", len(processedTools))
 
 			// Re-render prompt and reset parser if not first round (tool results were added)
 			if round > 0 {
+				// In JIT mode, get the current active tools (which may have grown)
+				currentTools := processedTools
+				if jitState != nil {
+					currentTools = jitState.GetActiveTools()
+					// Sync processedTools with JIT state for consistency
+					processedTools = currentTools
+					slog.Info("JIT: Re-rendering with updated tools", "round", round, "tools", len(currentTools))
+				}
+
 				var err error
-				prompt, images, err = chatPrompt(c.Request.Context(), m, r.Tokenize, opts, currentMsgs, processedTools, req.Think, truncate)
+				prompt, images, err = chatPrompt(c.Request.Context(), m, r.Tokenize, opts, currentMsgs, currentTools, req.Think, truncate)
 				if err != nil {
 					slog.Error("Failed to render prompt in round", "round", round, "error", err)
 					ch <- gin.H{"error": err.Error()}
 					return
 				}
+				// Log tool names for debugging
+				var toolNames []string
+				for _, t := range currentTools {
+					toolNames = append(toolNames, t.Function.Name)
+				}
+				slog.Info("JIT: Prompt re-rendered", "round", round, "prompt_length", len(prompt), "tool_names", toolNames)
 
 				// Create fresh parser instance for new round (parser has internal buffer state)
 				if builtinParser != nil && m.Config.Parser != "" {
 					builtinParser = parsers.ParserForName(m.Config.Parser)
 					if builtinParser != nil {
 						lastMsg := &currentMsgs[len(currentMsgs)-1]
-						builtinParser.Init(req.Tools, lastMsg, req.Think)
+						builtinParser.Init(currentTools, lastMsg, req.Think)
+						slog.Info("JIT: Parser re-initialized", "parser", m.Config.Parser, "tools_count", len(currentTools))
 					}
+				} else {
+					slog.Warn("JIT: No builtin parser available", "parser_name", m.Config.Parser, "builtin_nil", builtinParser == nil)
 				}
 			}
 
@@ -2534,6 +2595,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			// When MCP is enabled, suppress Done flag during intermediate rounds
 			// to prevent client from closing connection prematurely
 			suppressDone := mcpManager != nil
+			slog.Debug("Calling executeCompletionWithTools", "round", round, "prompt_len", len(prompt), "suppress_done", suppressDone)
 			completionResult, err := s.executeCompletionWithTools(
 				c.Request.Context(),
 				r,
@@ -2565,7 +2627,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			// Check if model called tools
 			if len(completionResult.ToolCalls) == 0 {
 				// No tools called - conversation is complete
-				slog.Debug("No tools called, conversation complete", "round", round)
+				slog.Info("No tools called, conversation complete", "round", round, "content_length", len(completionResult.Content))
 				break // Exit the loop - we're done
 			}
 			
@@ -2589,52 +2651,140 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				slog.Debug("MCP tool execution starting",
 					"tools_in_response", len(completionResult.ToolCalls),
 					"valid_tools", validToolCalls,
-					"round", round)
+					"round", round,
+					"jit_mode", jitState != nil)
+
+				// JIT MODE: Check for mcp_discover calls FIRST
+				var discoveryResults []api.ToolResult
+				var regularToolCalls []api.ToolCall
+
+				for _, toolCall := range completionResult.ToolCalls {
+					if jitState != nil && IsMCPDiscoverCall(toolCall) {
+						// Handle discovery
+						pattern, _ := toolCall.Function.Arguments.Get("pattern")
+						patternStr, _ := pattern.(string)
+
+						if patternStr == "" {
+							patternStr = "*" // Default to all if no pattern
+						}
+
+						newTools, summary, err := jitState.HandleDiscovery(patternStr, mcpManager)
+						if err != nil {
+							discoveryResults = append(discoveryResults, api.ToolResult{
+								ToolName:  "mcp_discover",
+								Arguments: toolCall.Function.Arguments,
+								Content:   fmt.Sprintf("Discovery error: %v", err),
+								Error:     err.Error(),
+							})
+							continue
+						}
+
+						// Inject discovered tools for next round
+						if len(newTools) > 0 {
+							processedTools = append(processedTools, newTools...)
+							slog.Info("JIT: Injected discovered tools",
+								"pattern", patternStr,
+								"count", len(newTools),
+								"total_active", len(processedTools))
+						}
+
+						// Add discovery result for model context
+						discoveryResults = append(discoveryResults, api.ToolResult{
+							ToolName:  "mcp_discover",
+							Arguments: toolCall.Function.Arguments,
+							Content:   summary,
+						})
+					} else {
+						regularToolCalls = append(regularToolCalls, toolCall)
+					}
+				}
+
+				// If we had discovery calls, notify client but DON'T add to message history
+				// This allows the model to "retry" with the discovered tools available
+				if len(discoveryResults) > 0 {
+					// Send discovery results to client for visibility
+					ch <- api.ChatResponse{
+						Model: req.Model,
+						Message: api.Message{
+							Role:        "assistant",
+							ToolResults: discoveryResults,
+						},
+					}
+					// NOTE: We intentionally do NOT add the discovery exchange to currentMsgs
+					// This lets the model retry the original request with the new tools available
+					slog.Info("JIT: Discovery complete, retrying with expanded tools",
+						"discovered", len(discoveryResults),
+						"messages_unchanged", len(currentMsgs))
+				}
+
+				// If ONLY discovery happened (no regular tools), continue to next round
+				if len(regularToolCalls) == 0 && len(discoveryResults) > 0 {
+					slog.Info("JIT: Only discovery calls, continuing to next round",
+						"round", round,
+						"regular_tools", len(regularToolCalls),
+						"discovery_results", len(discoveryResults),
+						"discovered_tools", jitState.GetDiscoveredToolCount())
+					continue // Next round with expanded tools
+				}
+
+				// If no regular tool calls, we're done
+				if len(regularToolCalls) == 0 {
+					break
+				}
 
 				// Note: Tool calls were already streamed to client during executeCompletionWithTools
 				// No need to re-send them here - that was causing duplicates in the response
 
-				// Analyze execution plan
-				executionPlan := mcpManager.AnalyzeExecutionPlan(completionResult.ToolCalls)
+				// Analyze execution plan for regular tools only
+				executionPlan := mcpManager.AnalyzeExecutionPlan(regularToolCalls)
 				slog.Debug("Execution plan determined",
 					"sequential", executionPlan.RequiresSequential,
 					"reason", executionPlan.Reason)
-				
-				// Execute tools according to plan
-				results := mcpManager.ExecuteWithPlan(completionResult.ToolCalls, executionPlan)
+
+				// Execute regular tools according to plan
+				results := mcpManager.ExecuteWithPlan(regularToolCalls, executionPlan)
 				
 				// Log tool calls for debugging
-				for i, tc := range completionResult.ToolCalls {
-					slog.Info("Tool call details", 
+				for i, tc := range regularToolCalls {
+					slog.Info("Tool call details",
 						"round", round,
 						"index", i,
 						"name", tc.Function.Name,
 						"arguments", tc.Function.Arguments)
 				}
-				
-				// Add assistant message with tool calls
-				assistantMsg := api.Message{
-					Role:      "assistant",
-					Content:   completionResult.Content, // Preserve any content
-					ToolCalls: completionResult.ToolCalls,
+
+				// Add assistant message with tool calls (only if not already added for discovery)
+				if len(discoveryResults) == 0 {
+					assistantMsg := api.Message{
+						Role:      "assistant",
+						Content:   completionResult.Content, // Preserve any content
+						ToolCalls: regularToolCalls,
+					}
+					currentMsgs = append(currentMsgs, assistantMsg)
+				} else {
+					// Discovery already added assistant msg, just add the regular tool calls
+					assistantMsg := api.Message{
+						Role:      "assistant",
+						ToolCalls: regularToolCalls,
+					}
+					currentMsgs = append(currentMsgs, assistantMsg)
 				}
-				currentMsgs = append(currentMsgs, assistantMsg)
-				
+
 				// Add tool result messages and send them to client for display
 				toolResultsForDisplay := make([]api.ToolResult, 0, len(results))
 				for i, result := range results {
 					toolMsg := api.Message{
 						Role:     "tool",
-						ToolName: completionResult.ToolCalls[i].Function.Name,
+						ToolName: regularToolCalls[i].Function.Name,
 					}
-					
+
 					// Create display result with arguments for context
 					displayResult := api.ToolResult{
-						ToolName:  completionResult.ToolCalls[i].Function.Name,
-						Arguments: completionResult.ToolCalls[i].Function.Arguments,
+						ToolName:  regularToolCalls[i].Function.Name,
+						Arguments: regularToolCalls[i].Function.Arguments,
 						Content:   result.Content,
 					}
-					
+
 					if result.Error != nil {
 						// JSON-encode the error for proper template rendering
 						if encoded, err := json.Marshal(fmt.Sprintf("Error: %v", result.Error)); err == nil {
@@ -2644,7 +2794,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 						}
 						displayResult.Error = result.Error.Error()
 						slog.Warn("Tool execution failed",
-							"tool", completionResult.ToolCalls[i].Function.Name,
+							"tool", regularToolCalls[i].Function.Name,
 							"error", result.Error)
 					} else {
 						// JSON-encode the content for proper template rendering
@@ -2675,7 +2825,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				slog.Info("Tools executed, continuing to next round",
 					"round", round,
 					"messages", len(currentMsgs),
-					"last_tool", completionResult.ToolCalls[len(completionResult.ToolCalls)-1].Function.Name)
+					"last_tool", regularToolCalls[len(regularToolCalls)-1].Function.Name)
 
 			} else {
 				// No MCP manager - send tool calls to client for external execution

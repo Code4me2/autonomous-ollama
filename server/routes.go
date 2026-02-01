@@ -2592,9 +2592,10 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			}
 
 			// Execute completion and collect full response
-			// When MCP is enabled, suppress Done flag during intermediate rounds
-			// to prevent client from closing connection prematurely
-			suppressDone := mcpManager != nil
+			// Always suppress Done flag during the tool loop since the model
+			// might call tools (which we need to handle even if just to return errors)
+			// We'll send Done: true after the loop completes
+			suppressDone := true
 			slog.Debug("Calling executeCompletionWithTools", "round", round, "prompt_len", len(prompt), "suppress_done", suppressDone)
 			completionResult, err := s.executeCompletionWithTools(
 				c.Request.Context(),
@@ -2828,9 +2829,51 @@ func (s *Server) ChatHandler(c *gin.Context) {
 					"last_tool", regularToolCalls[len(regularToolCalls)-1].Function.Name)
 
 			} else {
-				// No MCP manager - send tool calls to client for external execution
-				slog.Debug("No MCP manager, sending tool calls to client", "round", round)
-				break // Exit - client will handle tool execution
+				// No MCP manager - generate error results and feed back to model
+				slog.Warn("Tool calls made but no MCP manager available", "round", round, "tool_count", len(completionResult.ToolCalls))
+
+				// Create error results so model receives feedback
+				var errorResults []api.ToolResult
+				for _, tc := range completionResult.ToolCalls {
+					errorResults = append(errorResults, api.ToolResult{
+						ToolName:  tc.Function.Name,
+						Arguments: tc.Function.Arguments,
+						Error:     fmt.Sprintf("Tool '%s' is not available. No MCP servers are configured.", tc.Function.Name),
+					})
+				}
+
+				// Send error results to client for display
+				if len(errorResults) > 0 {
+					ch <- api.ChatResponse{
+						Model: req.Model,
+						Message: api.Message{
+							Role:        "assistant",
+							ToolCalls:   completionResult.ToolCalls,
+							ToolResults: errorResults,
+						},
+					}
+				}
+
+				// Add to conversation so model sees the error and can respond
+				assistantMsg := api.Message{
+					Role:      "assistant",
+					Content:   completionResult.Content,
+					ToolCalls: completionResult.ToolCalls,
+				}
+				currentMsgs = append(currentMsgs, assistantMsg)
+
+				// Add error results as tool messages
+				for _, result := range errorResults {
+					toolMsg := api.Message{
+						Role:     "tool",
+						ToolName: result.ToolName,
+						Content:  fmt.Sprintf("Error: %s", result.Error),
+					}
+					currentMsgs = append(currentMsgs, toolMsg)
+				}
+
+				// Continue to next round - model will see the errors and can respond
+				slog.Info("Tool errors fed back to model, continuing", "round", round)
 			}
 		} // End of maxRounds loop
 
@@ -2840,16 +2883,14 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			ch <- gin.H{"error": fmt.Sprintf("Maximum tool execution rounds (%d) exceeded", maxRounds)}
 		}
 
-		// When MCP was enabled, we suppressed Done flags during the loop
-		// Send a final Done: true to signal the conversation is complete
-		if mcpManager != nil {
-			ch <- api.ChatResponse{
-				Model:      req.Model,
-				CreatedAt:  time.Now().UTC(),
-				Message:    api.Message{Role: "assistant"},
-				Done:       true,
-				DoneReason: "stop",
-			}
+		// We suppressed Done flags during the loop to allow for tool execution
+		// or error feedback. Send a final Done: true to signal completion.
+		ch <- api.ChatResponse{
+			Model:      req.Model,
+			CreatedAt:  time.Now().UTC(),
+			Message:    api.Message{Role: "assistant"},
+			Done:       true,
+			DoneReason: "stop",
 		}
 	}()
 

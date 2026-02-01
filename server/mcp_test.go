@@ -46,6 +46,15 @@ import (
 	"github.com/ollama/ollama/api"
 )
 
+// makeTestArgs creates ToolCallFunctionArguments for testing
+func makeTestArgs(m map[string]any) api.ToolCallFunctionArguments {
+	args := api.NewToolCallFunctionArguments()
+	for k, v := range m {
+		args.Set(k, v)
+	}
+	return args
+}
+
 // TestMCPClientInitialization tests the MCP client initialization
 func TestMCPClientInitialization(t *testing.T) {
 	client := NewMCPClient("test", "echo", []string{"test"}, nil)
@@ -198,19 +207,19 @@ func TestParallelToolExecution(t *testing.T) {
 		{
 			Function: api.ToolCallFunction{
 				Name:      "tool1",
-				Arguments: map[string]interface{}{"test": "1"},
+				Arguments: makeTestArgs(map[string]any{"test": "1"}),
 			},
 		},
 		{
 			Function: api.ToolCallFunction{
 				Name:      "tool2",
-				Arguments: map[string]interface{}{"test": "2"},
+				Arguments: makeTestArgs(map[string]any{"test": "2"}),
 			},
 		},
 		{
 			Function: api.ToolCallFunction{
 				Name:      "tool3",
-				Arguments: map[string]interface{}{"test": "3"},
+				Arguments: makeTestArgs(map[string]any{"test": "3"}),
 			},
 		},
 	}
@@ -298,7 +307,7 @@ func BenchmarkToolExecution(b *testing.B) {
 	toolCall := api.ToolCall{
 		Function: api.ToolCallFunction{
 			Name:      "test_tool",
-			Arguments: map[string]interface{}{"param": "value"},
+			Arguments: makeTestArgs(map[string]any{"param": "value"}),
 		},
 	}
 
@@ -317,7 +326,7 @@ func BenchmarkParallelToolExecution(b *testing.B) {
 		toolCalls[i] = api.ToolCall{
 			Function: api.ToolCallFunction{
 				Name:      fmt.Sprintf("tool_%d", i),
-				Arguments: map[string]interface{}{"param": i},
+				Arguments: makeTestArgs(map[string]any{"param": i}),
 			},
 		}
 	}

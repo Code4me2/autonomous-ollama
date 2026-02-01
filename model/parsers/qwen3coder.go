@@ -155,11 +155,11 @@ func eat(p *Qwen3CoderParser) ([]qwenEvent, bool) {
 			p.acc.WriteString(after)
 			p.state = qwenParserState_CollectingToolContent
 			return events, true
-		} else if overlap := overlap(p.acc.String(), toolOpenTag); overlap > 0 {
+		} else if toolOverlap := overlap(p.acc.String(), toolOpenTag); toolOverlap > 0 {
 			// we found a partial tool open tag, so we can emit the unambiguous part,
 			// which is the (trailing-whitespace trimmed) content before the partial
 			// tool open tag
-			beforePartialTag := p.acc.String()[:len(p.acc.String())-overlap]
+			beforePartialTag := p.acc.String()[:len(p.acc.String())-toolOverlap]
 			trailingWhitespaceLen := trailingWhitespaceLen(beforePartialTag)
 			ambiguousStart := len(beforePartialTag) - trailingWhitespaceLen
 			unambiguous := p.acc.String()[:ambiguousStart]
@@ -170,9 +170,9 @@ func eat(p *Qwen3CoderParser) ([]qwenEvent, bool) {
 				events = append(events, qwenEventContent{content: unambiguous})
 			}
 			return events, false
-		} else if overlap := overlap(p.acc.String(), functionOpenTag); overlap > 0 {
+		} else if funcOverlap := overlap(p.acc.String(), functionOpenTag); funcOverlap > 0 {
 			// Same handling for partial <function= tag
-			beforePartialTag := p.acc.String()[:len(p.acc.String())-overlap]
+			beforePartialTag := p.acc.String()[:len(p.acc.String())-funcOverlap]
 			trailingWhitespaceLen := trailingWhitespaceLen(beforePartialTag)
 			ambiguousStart := len(beforePartialTag) - trailingWhitespaceLen
 			unambiguous := p.acc.String()[:ambiguousStart]

@@ -15,7 +15,7 @@ func TestMatchToolPattern(t *testing.T) {
 		// Wildcard patterns
 		{"*file*", "filesystem:read_file", true},
 		{"*file*", "filesystem:write_file", true},
-		{"*file*", "filesystem:list_directory", false},
+		{"*file*", "filesystem:list_directory", true}, // "file" matches in "filesystem"
 		{"*", "anything", true},
 		{"*", "filesystem:read_file", true},
 

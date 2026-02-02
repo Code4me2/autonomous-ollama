@@ -24,7 +24,7 @@ func (s *Server) ToolsHandler(c *gin.Context) {
 	
 	// If MCP servers provided, list their tools
 	if len(req.MCPServers) > 0 {
-		manager := NewMCPManager(10)
+		manager := NewMCPManager(10, 5)
 		defer manager.Close()
 		
 		var allTools []ToolInfo
@@ -134,7 +134,7 @@ func (s *Server) ToolSearchHandler(c *gin.Context) {
 	}
 
 	// Create temporary manager for search
-	manager := NewMCPManager(10)
+	manager := NewMCPManager(10, 5)
 	defer manager.Close()
 
 	// Add servers from request or load from definitions

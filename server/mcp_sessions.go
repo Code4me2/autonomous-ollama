@@ -47,8 +47,13 @@ func GetMCPSessionManager() *MCPSessionManager {
 	return globalSessionManager
 }
 
-// GetOrCreateManager gets existing or creates new MCP manager for session
-func (sm *MCPSessionManager) GetOrCreateManager(sessionID string, configs []api.MCPServerConfig) (*MCPManager, error) {
+// GetOrCreateManager gets existing or creates new MCP manager for session.
+// All managers use JIT - servers are registered but not connected until needed.
+func (sm *MCPSessionManager) GetOrCreateManager(
+	sessionID string,
+	configs []api.MCPServerConfig,
+	maxToolsPerDiscovery int,
+) (*MCPManager, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -65,12 +70,12 @@ func (sm *MCPSessionManager) GetOrCreateManager(sessionID string, configs []api.
 		delete(sm.sessions, sessionID)
 	}
 
-	// Create new session
+	// Create new session with JIT discovery
 	slog.Info("Creating new MCP session", "session", sessionID, "configs", len(configs))
-	manager := NewMCPManager(10)
+	manager := NewMCPManager(10, maxToolsPerDiscovery)
 	for _, config := range configs {
-		if err := manager.AddServer(config); err != nil {
-			slog.Warn("Failed to add MCP server", "name", config.Name, "error", err)
+		if err := manager.AddServerLazy(config); err != nil {
+			slog.Warn("Failed to register MCP server", "name", config.Name, "error", err)
 		}
 	}
 
@@ -82,24 +87,6 @@ func (sm *MCPSessionManager) GetOrCreateManager(sessionID string, configs []api.
 	}
 
 	return manager, nil
-}
-
-// GetManagerForToolsPath creates a manager for a tools directory path.
-// It uses the definitions system to get auto-enabled servers for the path.
-func (sm *MCPSessionManager) GetManagerForToolsPath(model string, toolsPath string) (*MCPManager, error) {
-	// Generate consistent session ID for model + tools path
-	sessionID := generateToolsSessionID(model, toolsPath)
-
-	// Use definitions to get auto-enabled servers (single source of truth)
-	defs, err := LoadMCPDefinitions()
-	if err != nil {
-		return nil, err
-	}
-
-	ctx := AutoEnableContext{ToolsPath: toolsPath}
-	configs := defs.GetAutoEnableServers(ctx)
-
-	return sm.GetOrCreateManager(sessionID, configs)
 }
 
 // cleanupExpired removes expired sessions

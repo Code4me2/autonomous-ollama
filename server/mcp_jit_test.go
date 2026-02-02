@@ -68,36 +68,36 @@ func TestMatchToolPattern(t *testing.T) {
 	}
 }
 
-func TestJITState_Basic(t *testing.T) {
-	state := NewJITState(5)
+func TestMCPManagerJIT_Basic(t *testing.T) {
+	manager := NewMCPManager(10, 5)
 
-	if state == nil {
-		t.Fatal("NewJITState returned nil")
+	if manager == nil {
+		t.Fatal("NewMCPManager returned nil")
 	}
 
-	if state.MaxToolsPerDiscovery != 5 {
-		t.Errorf("MaxToolsPerDiscovery = %d, want 5", state.MaxToolsPerDiscovery)
+	if manager.GetMaxToolsPerDiscovery() != 5 {
+		t.Errorf("GetMaxToolsPerDiscovery() = %d, want 5", manager.GetMaxToolsPerDiscovery())
 	}
 
-	if state.GetDiscoveredToolCount() != 0 {
-		t.Errorf("GetDiscoveredToolCount() = %d, want 0", state.GetDiscoveredToolCount())
+	if manager.GetDiscoveredToolCount() != 0 {
+		t.Errorf("GetDiscoveredToolCount() = %d, want 0", manager.GetDiscoveredToolCount())
 	}
 
-	if state.GetPendingServerCount() != 0 {
-		t.Errorf("GetPendingServerCount() = %d, want 0", state.GetPendingServerCount())
+	if manager.GetPendingServerCount() != 0 {
+		t.Errorf("GetPendingServerCount() = %d, want 0", manager.GetPendingServerCount())
 	}
 }
 
-func TestJITState_DefaultMaxTools(t *testing.T) {
+func TestMCPManagerJIT_DefaultMaxTools(t *testing.T) {
 	// Test that 0 or negative values default to 5
-	state := NewJITState(0)
-	if state.MaxToolsPerDiscovery != 5 {
-		t.Errorf("NewJITState(0).MaxToolsPerDiscovery = %d, want 5", state.MaxToolsPerDiscovery)
+	manager := NewMCPManager(10, 0)
+	if manager.GetMaxToolsPerDiscovery() != 5 {
+		t.Errorf("NewMCPManager(10, 0).GetMaxToolsPerDiscovery() = %d, want 5", manager.GetMaxToolsPerDiscovery())
 	}
 
-	state = NewJITState(-1)
-	if state.MaxToolsPerDiscovery != 5 {
-		t.Errorf("NewJITState(-1).MaxToolsPerDiscovery = %d, want 5", state.MaxToolsPerDiscovery)
+	manager = NewMCPManager(10, -1)
+	if manager.GetMaxToolsPerDiscovery() != 5 {
+		t.Errorf("NewMCPManager(10, -1).GetMaxToolsPerDiscovery() = %d, want 5", manager.GetMaxToolsPerDiscovery())
 	}
 }
 
@@ -146,5 +146,65 @@ func TestMCPDiscoverTool_Schema(t *testing.T) {
 	required := MCPDiscoverTool.Function.Parameters.Required
 	if len(required) != 1 || required[0] != "pattern" {
 		t.Errorf("MCPDiscoverTool.Function.Parameters.Required = %v, want [\"pattern\"]", required)
+	}
+}
+
+func TestMCPManagerJIT_GetActiveTools(t *testing.T) {
+	manager := NewMCPManager(10, 5)
+
+	// Initially should only have mcp_discover
+	tools := manager.GetActiveTools()
+	if len(tools) != 1 {
+		t.Errorf("GetActiveTools() returned %d tools, want 1", len(tools))
+	}
+	if tools[0].Function.Name != "mcp_discover" {
+		t.Errorf("GetActiveTools()[0].Function.Name = %q, want \"mcp_discover\"", tools[0].Function.Name)
+	}
+}
+
+func TestMCPManagerJIT_AddDiscoveredTools(t *testing.T) {
+	manager := NewMCPManager(10, 5)
+
+	// Add some discovered tools
+	testTools := []api.Tool{
+		{Type: "function", Function: api.ToolFunction{Name: "test_tool_1"}},
+		{Type: "function", Function: api.ToolFunction{Name: "test_tool_2"}},
+	}
+	manager.AddDiscoveredTools(testTools, "test_server")
+
+	// Check count
+	if manager.GetDiscoveredToolCount() != 2 {
+		t.Errorf("GetDiscoveredToolCount() = %d, want 2", manager.GetDiscoveredToolCount())
+	}
+
+	// Check active tools includes mcp_discover + discovered tools
+	tools := manager.GetActiveTools()
+	if len(tools) != 3 {
+		t.Errorf("GetActiveTools() returned %d tools, want 3", len(tools))
+	}
+
+	// Verify tool routing was set
+	client, exists := manager.GetToolClient("test_tool_1")
+	if !exists || client != "test_server" {
+		t.Errorf("GetToolClient(\"test_tool_1\") = %q, %v, want \"test_server\", true", client, exists)
+	}
+}
+
+func TestMCPManagerJIT_IsToolDiscovered(t *testing.T) {
+	manager := NewMCPManager(10, 5)
+
+	// Initially no tools discovered
+	if manager.IsToolDiscovered("test_tool") {
+		t.Error("IsToolDiscovered(\"test_tool\") should be false initially")
+	}
+
+	// Add a discovered tool
+	manager.AddDiscoveredTools([]api.Tool{
+		{Type: "function", Function: api.ToolFunction{Name: "test_tool"}},
+	}, "test_server")
+
+	// Now it should be discovered
+	if !manager.IsToolDiscovered("test_tool") {
+		t.Error("IsToolDiscovered(\"test_tool\") should be true after adding")
 	}
 }

@@ -2338,79 +2338,30 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	// =========================================================================
 
 	var mcpManager *MCPManager
-	var jitState *JITState
 
-	// Determine if JIT mode is enabled (default: true for API requests with mcp_servers)
-	jitEnabled := true
-	if req.JITTools != nil {
-		jitEnabled = *req.JITTools
-	}
-	// Disable JIT for path-based mode (CLI) to maintain backward compatibility
-	if req.ToolsPath != "" {
-		jitEnabled = false
+	// Unified server resolution: merges explicit servers with auto-enabled servers
+	servers, err := ResolveServersForRequest(req)
+	if err != nil {
+		slog.Warn("Failed to resolve servers", "error", err)
 	}
 
-	if len(req.MCPServers) > 0 || req.ToolsPath != "" {
-		if req.ToolsPath != "" {
-			// Path-based mode: auto-enable servers matching the tools path
-			// Used by CLI: `ollama run model --tools /path`
-			slog.Debug("Using tools path for MCP manager", "tools_path", req.ToolsPath, "model", req.Model)
-			mcpManager, err = GetMCPManagerForPath(req.Model, req.ToolsPath)
-			if err != nil {
-				slog.Error("Failed to get MCP manager for tools path", "error", err)
-				// Continue without MCP - graceful degradation
-			}
-		} else if len(req.MCPServers) > 0 {
-			if jitEnabled {
-				// JIT MODE: Initialize state with pending servers
-				jitState = NewJITState(req.JITMaxTools)
-				mcpManager = NewMCPManagerLazy(10)
-
-				for _, serverConfig := range req.MCPServers {
-					jitState.AddPendingServer(serverConfig)
-					if req.JITConnectEager {
-						// Pre-connect servers in eager mode
-						if err := mcpManager.AddServer(serverConfig); err != nil {
-							slog.Warn("JIT: Failed to pre-connect MCP server", "name", serverConfig.Name, "error", err)
-						}
-					} else {
-						// Register for lazy connection
-						if err := mcpManager.AddServerLazy(serverConfig); err != nil {
-							slog.Warn("JIT: Failed to register MCP server", "name", serverConfig.Name, "error", err)
-						}
-					}
-				}
-
-				slog.Info("JIT tools mode enabled",
-					"pending_servers", jitState.GetPendingServerCount(),
-					"max_tools_per_discovery", jitState.MaxToolsPerDiscovery,
-					"eager_connect", req.JITConnectEager)
-			} else {
-				// LEGACY MODE: Connect all servers and load all tools upfront
-				sessionID := GenerateSessionID(req)
-				slog.Debug("Getting MCP manager (legacy mode)", "session", sessionID, "servers", len(req.MCPServers))
-				mcpManager, err = GetMCPManager(sessionID, req.MCPServers)
-				if err != nil {
-					slog.Error("Failed to get MCP manager", "error", err)
-					// Continue without MCP - graceful degradation
-				}
-			}
+	if len(servers) > 0 {
+		sessionID := GenerateSessionID(req)
+		mcpManager, err = GetMCPManager(sessionID, servers, req.JITMaxTools)
+		if err != nil {
+			slog.Error("Failed to create MCP manager", "error", err)
+		} else {
+			slog.Info("MCP manager created",
+				"session", sessionID,
+				"pending_servers", mcpManager.GetPendingServerCount(),
+				"max_tools_per_discovery", mcpManager.GetMaxToolsPerDiscovery(),
+				"tools_path", req.ToolsPath)
 		}
 
 		if mcpManager != nil {
-			if jitEnabled && jitState != nil {
-				// JIT MODE: Start with only mcp_discover tool
-				req.Tools = append(req.Tools, MCPDiscoverTool)
-				slog.Debug("JIT: Starting with mcp_discover tool only")
-			} else {
-				// LEGACY MODE: Load all tools upfront
-				mcpTools := mcpManager.GetAllTools()
-				req.Tools = append(req.Tools, mcpTools...)
-
-				// Inject context to help model use tools effectively
-				codeAPI := NewMCPCodeAPI(mcpManager)
-				req.Messages = codeAPI.InjectContextIntoMessages(req.Messages, req.MCPServers)
-			}
+			// JIT: Start with only mcp_discover tool - model discovers others as needed
+			req.Tools = append(req.Tools, MCPDiscoverTool)
+			slog.Debug("MCP: Starting with mcp_discover tool only")
 
 			// Auto-configure parser for tool call detection
 			if len(req.Tools) > 0 && m.Config.Parser == "" {
@@ -2555,13 +2506,13 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 			// Re-render prompt and reset parser if not first round (tool results were added)
 			if round > 0 {
-				// In JIT mode, get the current active tools (which may have grown)
+				// Get the current active tools (which may have grown via discovery)
 				currentTools := processedTools
-				if jitState != nil {
-					currentTools = jitState.GetActiveTools()
-					// Sync processedTools with JIT state for consistency
+				if mcpManager != nil {
+					currentTools = mcpManager.GetActiveTools()
+					// Sync processedTools with manager state for consistency
 					processedTools = currentTools
-					slog.Info("JIT: Re-rendering with updated tools", "round", round, "tools", len(currentTools))
+					slog.Info("MCP: Re-rendering with updated tools", "round", round, "tools", len(currentTools))
 				}
 
 				var err error
@@ -2652,15 +2603,14 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				slog.Debug("MCP tool execution starting",
 					"tools_in_response", len(completionResult.ToolCalls),
 					"valid_tools", validToolCalls,
-					"round", round,
-					"jit_mode", jitState != nil)
+					"round", round)
 
-				// JIT MODE: Check for mcp_discover calls FIRST
+				// Check for mcp_discover calls FIRST
 				var discoveryResults []api.ToolResult
 				var regularToolCalls []api.ToolCall
 
 				for _, toolCall := range completionResult.ToolCalls {
-					if jitState != nil && IsMCPDiscoverCall(toolCall) {
+					if IsMCPDiscoverCall(toolCall) {
 						// Handle discovery
 						pattern, _ := toolCall.Function.Arguments.Get("pattern")
 						patternStr, _ := pattern.(string)
@@ -2669,7 +2619,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 							patternStr = "*" // Default to all if no pattern
 						}
 
-						newTools, summary, err := jitState.HandleDiscovery(patternStr, mcpManager)
+						newTools, summary, err := mcpManager.HandleDiscovery(patternStr)
 						if err != nil {
 							discoveryResults = append(discoveryResults, api.ToolResult{
 								ToolName:  "mcp_discover",
@@ -2724,7 +2674,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 						"round", round,
 						"regular_tools", len(regularToolCalls),
 						"discovery_results", len(discoveryResults),
-						"discovered_tools", jitState.GetDiscoveredToolCount())
+						"discovered_tools", mcpManager.GetDiscoveredToolCount())
 					continue // Next round with expanded tools
 				}
 

@@ -4,10 +4,10 @@
 //
 //	┌─────────────────────────────────────────────────────────────────┐
 //	│                    Public API (this file)                       │
-//	│  GetMCPServersForTools()  - Get servers for --tools flag        │
-//	│  GetMCPManager()          - Get manager for explicit configs    │
-//	│  GetMCPManagerForPath()   - Get manager for tools path          │
-//	│  ListMCPServers()         - List available server definitions   │
+//	│  GetMCPServersForTools()    - Get servers for --tools flag      │
+//	│  GetMCPManager()            - Get/create manager with JIT       │
+//	│  ResolveServersForRequest() - Unified server resolution         │
+//	│  ListMCPServers()           - List available server definitions │
 //	└─────────────────────────────────────────────────────────────────┘
 //	                              │
 //	          ┌───────────────────┴───────────────────┐
@@ -93,15 +93,10 @@ func GetMCPServersForTools(toolsSpec string) ([]api.MCPServerConfig, string, err
 }
 
 // GetMCPManager returns an MCP manager for the given session and configs.
+// All managers use JIT discovery - servers are registered but not connected until needed.
 // If a session with matching configs already exists, it will be reused.
-func GetMCPManager(sessionID string, configs []api.MCPServerConfig) (*MCPManager, error) {
-	return GetMCPSessionManager().GetOrCreateManager(sessionID, configs)
-}
-
-// GetMCPManagerForPath returns an MCP manager for servers that auto-enable
-// for the given tools path. Used by CLI: `ollama run model --tools /path`
-func GetMCPManagerForPath(model string, toolsPath string) (*MCPManager, error) {
-	return GetMCPSessionManager().GetManagerForToolsPath(model, toolsPath)
+func GetMCPManager(sessionID string, configs []api.MCPServerConfig, maxToolsPerDiscovery int) (*MCPManager, error) {
+	return GetMCPSessionManager().GetOrCreateManager(sessionID, configs, maxToolsPerDiscovery)
 }
 
 // ListMCPServers returns information about all available MCP server definitions.
@@ -111,4 +106,36 @@ func ListMCPServers() ([]MCPServerInfo, error) {
 		return nil, err
 	}
 	return defs.ListServers(), nil
+}
+
+// ResolveServersForRequest returns the unified set of MCP servers for a request.
+// It merges explicit servers (req.MCPServers) with auto-enabled servers from tools path.
+// Explicit servers take precedence over auto-enabled servers with the same name.
+func ResolveServersForRequest(req api.ChatRequest) ([]api.MCPServerConfig, error) {
+	servers := make([]api.MCPServerConfig, 0, len(req.MCPServers))
+	serverNames := make(map[string]bool)
+
+	// Explicit servers take precedence
+	for _, s := range req.MCPServers {
+		servers = append(servers, s)
+		serverNames[s.Name] = true
+	}
+
+	// Add auto-enabled servers if tools path provided
+	if req.ToolsPath != "" {
+		defs, err := LoadMCPDefinitions()
+		if err != nil {
+			// Graceful degradation - return explicit servers only
+			return servers, nil
+		}
+		ctx := AutoEnableContext{ToolsPath: req.ToolsPath}
+		for _, autoServer := range defs.GetAutoEnableServers(ctx) {
+			if !serverNames[autoServer.Name] {
+				servers = append(servers, autoServer)
+				serverNames[autoServer.Name] = true
+			}
+		}
+	}
+
+	return servers, nil
 }

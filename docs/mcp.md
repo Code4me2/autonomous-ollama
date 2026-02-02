@@ -52,10 +52,10 @@ curl -X POST http://localhost:11434/api/chat \
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Public API (mcp.go)                          │
-│  GetMCPServersForTools()  - Get servers for --tools flag        │
-│  GetMCPManager()          - Get manager for explicit configs    │
-│  GetMCPManagerForPath()   - Get manager for tools path          │
-│  ListMCPServers()         - List available server definitions   │
+│  GetMCPServersForTools()    - Get servers for --tools flag      │
+│  GetMCPManager()            - Get/create manager (always JIT)   │
+│  ResolveServersForRequest() - Unified server resolution         │
+│  ListMCPServers()           - List available server definitions │
 └─────────────────────────────────────────────────────────────────┘
                               │
           ┌───────────────────┴───────────────────┐

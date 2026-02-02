@@ -9,16 +9,21 @@ import (
 	"github.com/ollama/ollama/api"
 )
 
-// MCPManager manages multiple MCP server connections and provides tool execution services
+// MCPManager manages multiple MCP server connections and provides tool execution services.
+// All servers use lazy/JIT connection - servers are registered but not connected until needed.
 type MCPManager struct {
 	mu          sync.RWMutex
 	clients     map[string]*MCPClient
 	toolRouting map[string]string // tool name -> client name mapping
 	maxClients  int
 
-	// Lazy connection support for JIT mode
+	// Lazy connection support (always enabled - JIT is the only mode)
 	pendingConfigs map[string]api.MCPServerConfig
-	lazyMode       bool
+
+	// JIT discovery state
+	discoveredTools      map[string]api.Tool   // tool name -> tool schema
+	allToolsCache        map[string][]api.Tool // server name -> tools (for pattern matching)
+	maxToolsPerDiscovery int                   // limits injection per discovery call
 }
 
 // MCPServerConfig is imported from api package
@@ -36,25 +41,20 @@ type ExecutionPlan struct {
 	Reason             string  // Explanation of why this plan was chosen
 }
 
-// NewMCPManager creates a new MCP manager
-func NewMCPManager(maxClients int) *MCPManager {
-	return &MCPManager{
-		clients:        make(map[string]*MCPClient),
-		toolRouting:    make(map[string]string),
-		pendingConfigs: make(map[string]api.MCPServerConfig),
-		maxClients:     maxClients,
-		lazyMode:       false,
+// NewMCPManager creates a new MCP manager with JIT discovery.
+// Servers are registered lazily and connected on first use.
+func NewMCPManager(maxClients int, maxToolsPerDiscovery int) *MCPManager {
+	if maxToolsPerDiscovery <= 0 {
+		maxToolsPerDiscovery = 5 // Default
 	}
-}
-
-// NewMCPManagerLazy creates a manager that defers server connections
-func NewMCPManagerLazy(maxClients int) *MCPManager {
 	return &MCPManager{
-		clients:        make(map[string]*MCPClient),
-		toolRouting:    make(map[string]string),
-		pendingConfigs: make(map[string]api.MCPServerConfig),
-		maxClients:     maxClients,
-		lazyMode:       true,
+		clients:              make(map[string]*MCPClient),
+		toolRouting:          make(map[string]string),
+		pendingConfigs:       make(map[string]api.MCPServerConfig),
+		maxClients:           maxClients,
+		discoveredTools:      make(map[string]api.Tool),
+		allToolsCache:        make(map[string][]api.Tool),
+		maxToolsPerDiscovery: maxToolsPerDiscovery,
 	}
 }
 
@@ -141,10 +141,6 @@ func (m *MCPManager) GetToolsFromServer(serverName string) ([]api.Tool, error) {
 	return client.ListTools()
 }
 
-// IsLazyMode returns whether the manager is in lazy connection mode
-func (m *MCPManager) IsLazyMode() bool {
-	return m.lazyMode
-}
 
 // GetPendingServerCount returns the number of servers awaiting connection
 func (m *MCPManager) GetPendingServerCount() int {
@@ -541,6 +537,185 @@ func (m *MCPManager) Close() error {
 func (m *MCPManager) Shutdown() error {
 	slog.Info("Shutting down MCP manager", "clients", len(m.clients))
 	return m.Close()
+}
+
+// =============================================================================
+// JIT Discovery Methods (unified state management)
+// =============================================================================
+
+// GetActiveTools returns mcp_discover + all discovered tools for JIT mode
+func (m *MCPManager) GetActiveTools() []api.Tool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	tools := []api.Tool{MCPDiscoverTool}
+	for _, tool := range m.discoveredTools {
+		tools = append(tools, tool)
+	}
+	return tools
+}
+
+// AddDiscoveredTools adds newly discovered tools to active set
+func (m *MCPManager) AddDiscoveredTools(tools []api.Tool, serverName string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, tool := range tools {
+		m.discoveredTools[tool.Function.Name] = tool
+		m.toolRouting[tool.Function.Name] = serverName
+	}
+}
+
+// IsToolDiscovered checks if a tool is already available
+func (m *MCPManager) IsToolDiscovered(toolName string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, exists := m.discoveredTools[toolName]
+	return exists
+}
+
+// SearchTools searches all pending/connected servers for matching tools
+func (m *MCPManager) SearchTools(pattern string) ([]api.Tool, []string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var matchedTools []api.Tool
+	var serversTried []string
+	seen := make(map[string]bool)
+
+	// Search each pending server
+	for serverName, config := range m.pendingConfigs {
+		serversTried = append(serversTried, serverName)
+
+		// Connect to server if not already connected
+		if _, connected := m.clients[serverName]; !connected {
+			// Need to unlock for AddServer (which takes its own lock)
+			m.mu.Unlock()
+			if err := m.AddServer(config); err != nil {
+				slog.Warn("JIT: Failed to connect to MCP server for discovery",
+					"server", serverName, "error", err)
+				m.mu.Lock()
+				continue
+			}
+			m.mu.Lock()
+		}
+
+		// Get tools from cache or fetch
+		var tools []api.Tool
+		if cached, exists := m.allToolsCache[serverName]; exists {
+			tools = cached
+		} else {
+			m.mu.Unlock()
+			var err error
+			tools, err = m.GetToolsFromServer(serverName)
+			m.mu.Lock()
+			if err != nil {
+				slog.Warn("JIT: Failed to list tools from server",
+					"server", serverName, "error", err)
+				continue
+			}
+			m.allToolsCache[serverName] = tools
+		}
+
+		// Match against pattern
+		for _, tool := range tools {
+			if seen[tool.Function.Name] {
+				continue
+			}
+			if MatchToolPattern(pattern, tool.Function.Name) {
+				matchedTools = append(matchedTools, tool)
+				seen[tool.Function.Name] = true
+				m.toolRouting[tool.Function.Name] = serverName
+
+				// Respect limit
+				if len(matchedTools) >= m.maxToolsPerDiscovery {
+					return matchedTools, serversTried, nil
+				}
+			}
+		}
+	}
+
+	return matchedTools, serversTried, nil
+}
+
+// HandleDiscovery processes an mcp_discover call and returns:
+// - tools: schemas to inject for next round
+// - summary: human-readable result for model context
+// - error: any error encountered
+func (m *MCPManager) HandleDiscovery(pattern string) ([]api.Tool, string, error) {
+	tools, servers, err := m.SearchTools(pattern)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if len(tools) == 0 {
+		return nil, fmt.Sprintf(
+			"No tools found matching pattern '%s'. Searched servers: %s. "+
+				"Try a different pattern like '*file*', '*git*', or '*' to see all.",
+			pattern, strings.Join(servers, ", ")), nil
+	}
+
+	// Filter out already discovered tools
+	var newTools []api.Tool
+	m.mu.RLock()
+	for _, tool := range tools {
+		if _, exists := m.discoveredTools[tool.Function.Name]; !exists {
+			newTools = append(newTools, tool)
+		}
+	}
+	m.mu.RUnlock()
+
+	// Build summary for model
+	var summaryParts []string
+	for _, tool := range tools {
+		// Truncate description for summary
+		desc := tool.Function.Description
+		if len(desc) > 80 {
+			desc = desc[:77] + "..."
+		}
+		summaryParts = append(summaryParts,
+			fmt.Sprintf("- %s: %s", tool.Function.Name, desc))
+	}
+
+	alreadyKnown := len(tools) - len(newTools)
+	summary := fmt.Sprintf(
+		"Found %d tools matching '%s':\n%s",
+		len(tools), pattern, strings.Join(summaryParts, "\n"))
+
+	if alreadyKnown > 0 {
+		summary += fmt.Sprintf("\n\n(%d tools were already available)", alreadyKnown)
+	}
+
+	if len(newTools) > 0 {
+		summary += "\n\nThese tools are now available. Call them directly in your next response."
+	}
+
+	// Add new tools to discovered set
+	m.mu.Lock()
+	for _, tool := range newTools {
+		m.discoveredTools[tool.Function.Name] = tool
+	}
+	m.mu.Unlock()
+
+	slog.Info("JIT: Discovery completed",
+		"pattern", pattern,
+		"found", len(tools),
+		"new", len(newTools),
+		"already_known", alreadyKnown)
+
+	return newTools, summary, nil
+}
+
+// GetDiscoveredToolCount returns the number of discovered tools
+func (m *MCPManager) GetDiscoveredToolCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.discoveredTools)
+}
+
+// GetMaxToolsPerDiscovery returns the max tools limit
+func (m *MCPManager) GetMaxToolsPerDiscovery() int {
+	return m.maxToolsPerDiscovery
 }
 
 // validateServerConfig validates MCP server configuration for security

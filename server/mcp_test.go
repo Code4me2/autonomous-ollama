@@ -98,7 +98,7 @@ func TestSecureEnvironmentFiltering(t *testing.T) {
 
 // TestMCPManagerAddServer tests adding MCP servers to the manager
 func TestMCPManagerAddServer(t *testing.T) {
-	manager := NewMCPManager(5)
+	manager := NewMCPManager(5, 5)
 
 	// Test adding a valid server config
 	config := api.MCPServerConfig{
@@ -130,7 +130,7 @@ func TestMCPManagerAddServer(t *testing.T) {
 
 // TestDangerousCommandValidation tests rejection of dangerous commands
 func TestDangerousCommandValidation(t *testing.T) {
-	manager := NewMCPManager(5)
+	manager := NewMCPManager(5, 5)
 
 	dangerousConfigs := []api.MCPServerConfig{
 		{Name: "test1", Command: "bash"},
@@ -163,7 +163,7 @@ func TestDangerousCommandValidation(t *testing.T) {
 
 // TestShellInjectionPrevention tests prevention of shell injection
 func TestShellInjectionPrevention(t *testing.T) {
-	manager := NewMCPManager(5)
+	manager := NewMCPManager(5, 5)
 
 	// Test arguments with shell metacharacters
 	injectionConfigs := []api.MCPServerConfig{
@@ -200,7 +200,7 @@ func TestShellInjectionPrevention(t *testing.T) {
 
 // TestParallelToolExecution tests parallel execution of tools
 func TestParallelToolExecution(t *testing.T) {
-	manager := NewMCPManager(5)
+	manager := NewMCPManager(5, 5)
 
 	// Create test tool calls
 	toolCalls := []api.ToolCall{
@@ -259,7 +259,7 @@ func TestMCPClientTimeout(t *testing.T) {
 
 // TestEnvironmentVariableValidation tests validation of environment variables
 func TestEnvironmentVariableValidation(t *testing.T) {
-	manager := NewMCPManager(5)
+	manager := NewMCPManager(5, 5)
 
 	// Test invalid environment variable names
 	invalidEnvConfigs := []api.MCPServerConfig{
@@ -302,7 +302,7 @@ func TestEnvironmentVariableValidation(t *testing.T) {
 
 // BenchmarkToolExecution benchmarks tool execution performance
 func BenchmarkToolExecution(b *testing.B) {
-	manager := NewMCPManager(10)
+	manager := NewMCPManager(10, 5)
 
 	toolCall := api.ToolCall{
 		Function: api.ToolCallFunction{
@@ -319,7 +319,7 @@ func BenchmarkToolExecution(b *testing.B) {
 
 // BenchmarkParallelToolExecution benchmarks parallel tool execution
 func BenchmarkParallelToolExecution(b *testing.B) {
-	manager := NewMCPManager(10)
+	manager := NewMCPManager(10, 5)
 
 	toolCalls := make([]api.ToolCall, 10)
 	for i := range toolCalls {
@@ -737,4 +737,83 @@ func TestEnableCondition_EmptyConditions(t *testing.T) {
 	servers := defs.GetAutoEnableServers(ctx)
 
 	require.Len(t, servers, 1, "Expected 1 server with empty conditions")
+}
+
+// =============================================================================
+// ResolveServersForRequest Tests (Unified Architecture)
+// =============================================================================
+
+// TestResolveServersForRequest_ExplicitOnly verifies explicit servers are returned
+func TestResolveServersForRequest_ExplicitOnly(t *testing.T) {
+	req := api.ChatRequest{
+		MCPServers: []api.MCPServerConfig{
+			{Name: "explicit1", Command: "python", Args: []string{"arg1"}},
+			{Name: "explicit2", Command: "node", Args: []string{"arg2"}},
+		},
+	}
+
+	servers, err := ResolveServersForRequest(req)
+	require.NoError(t, err)
+	require.Len(t, servers, 2)
+	require.Equal(t, "explicit1", servers[0].Name)
+	require.Equal(t, "explicit2", servers[1].Name)
+}
+
+// TestResolveServersForRequest_ToolsPathOnly verifies auto-enable servers are returned
+func TestResolveServersForRequest_ToolsPathOnly(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mcp-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	req := api.ChatRequest{
+		ToolsPath: tmpDir,
+	}
+
+	servers, err := ResolveServersForRequest(req)
+	require.NoError(t, err)
+	// Auto-enabled servers depend on user configuration
+	// Just verify no error occurred and result is a valid slice
+	// (may be empty if user has no auto-enable servers configured)
+	require.NotNil(t, servers, "Expected non-nil servers slice")
+}
+
+// TestResolveServersForRequest_MergeExplicitAndAutoEnable verifies explicit takes precedence
+func TestResolveServersForRequest_MergeExplicitAndAutoEnable(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mcp-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	req := api.ChatRequest{
+		// Explicit server with same name as auto-enable server
+		MCPServers: []api.MCPServerConfig{
+			{Name: "filesystem", Command: "custom-command", Args: []string{"custom-args"}},
+		},
+		ToolsPath: tmpDir,
+	}
+
+	servers, err := ResolveServersForRequest(req)
+	require.NoError(t, err)
+
+	// Find the filesystem server
+	var fsServer *api.MCPServerConfig
+	for i := range servers {
+		if servers[i].Name == "filesystem" {
+			fsServer = &servers[i]
+			break
+		}
+	}
+
+	require.NotNil(t, fsServer, "Expected filesystem server in results")
+	// Explicit config should take precedence
+	require.Equal(t, "custom-command", fsServer.Command, "Expected explicit server config to take precedence")
+	require.Equal(t, []string{"custom-args"}, fsServer.Args)
+}
+
+// TestResolveServersForRequest_Empty verifies empty request returns empty
+func TestResolveServersForRequest_Empty(t *testing.T) {
+	req := api.ChatRequest{}
+
+	servers, err := ResolveServersForRequest(req)
+	require.NoError(t, err)
+	require.Empty(t, servers)
 }

@@ -2363,6 +2363,10 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			req.Tools = append(req.Tools, MCPDiscoverTool)
 			slog.Debug("MCP: Starting with mcp_discover tool only")
 
+			// Inject context explaining mcp_discover and working directory
+			codeAPI := NewMCPCodeAPI(mcpManager)
+			req.Messages = codeAPI.InjectJITContext(req.Messages, servers)
+
 			// Auto-configure parser for tool call detection
 			if len(req.Tools) > 0 && m.Config.Parser == "" {
 				if m.Config.ModelFamily == "qwen2" || m.Config.ModelFamily == "qwen3" {
@@ -2650,8 +2654,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 					}
 				}
 
-				// If we had discovery calls, notify client but DON'T add to message history
-				// This allows the model to "retry" with the discovered tools available
+				// If we had discovery calls, add to context so model knows tools are available
 				if len(discoveryResults) > 0 {
 					// Send discovery results to client for visibility
 					ch <- api.ChatResponse{
@@ -2661,11 +2664,19 @@ func (s *Server) ChatHandler(c *gin.Context) {
 							ToolResults: discoveryResults,
 						},
 					}
-					// NOTE: We intentionally do NOT add the discovery exchange to currentMsgs
-					// This lets the model retry the original request with the new tools available
-					slog.Info("JIT: Discovery complete, retrying with expanded tools",
+
+					// Add discovery to message history so model knows tools are now available
+					// Build a tool result message with the discovery summary
+					for _, dr := range discoveryResults {
+						currentMsgs = append(currentMsgs, api.Message{
+							Role:    "tool",
+							Content: dr.Content,
+						})
+					}
+
+					slog.Info("JIT: Discovery complete, tools now in context",
 						"discovered", len(discoveryResults),
-						"messages_unchanged", len(currentMsgs))
+						"messages", len(currentMsgs))
 				}
 
 				// If ONLY discovery happened (no regular tools), continue to next round

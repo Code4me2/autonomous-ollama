@@ -53,13 +53,22 @@ func (m *MCPCodeAPI) GenerateJITContext(configs []api.MCPServerConfig) string {
 
 IMPORTANT: You start with only one tool: mcp_discover. To access other tools (file operations, etc.), you MUST first call mcp_discover to find and enable them.
 
-Example workflow:
-1. User asks to read a file
-2. You call: mcp_discover(pattern="*file*")
-3. Tools like read_file, write_file become available
-4. You call the discovered tool: read_file(path="example.txt")
+TOOL CALL FORMAT (you MUST use this exact format):
+[TOOL_CALLS]tool_name[ARGS]{"argument": "value"}
 
-Call mcp_discover with patterns like "*file*", "*search*", "*git*", or "*" to see all tools.
+Example workflow:
+1. User asks to list and read files
+2. First discover directory tools:
+   [TOOL_CALLS]mcp_discover[ARGS]{"pattern": "*directory*"}
+3. Then discover file tools:
+   [TOOL_CALLS]mcp_discover[ARGS]{"pattern": "*file*"}
+4. Use discovered tools:
+   [TOOL_CALLS]list_directory[ARGS]{"path": "."}
+   [TOOL_CALLS]read_file[ARGS]{"path": "example.txt"}
+
+MULTI-STEP TASKS: If a task involves multiple types of operations (e.g., "list files and read them"), call mcp_discover multiple times with different patterns to find all needed tools BEFORE attempting the operations.
+
+Common patterns: "*file*", "*directory*", "*list*", "*search*", "*git*", "*" (all tools)
 `)
 
 	// Add filesystem working directory if applicable

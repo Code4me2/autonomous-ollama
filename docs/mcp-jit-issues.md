@@ -1,38 +1,35 @@
-# MCP JIT Implementation - Remaining Issues
+# MCP JIT Implementation - Issues Tracker
 
-## Status: Work in Progress
+## Status: Active Development
 
-This document tracks known issues with the unified MCP/JIT architecture as of 2026-02-02.
+This document tracks known issues with the unified MCP/JIT architecture.
+
+Last updated: 2026-02-06
 
 ---
 
 ## Issue 1: Parser Inconsistency on First Request
+
+**Status: ✅ FIXED** (commits da4db323, 8ee6c90c)
 
 **Symptom:** First tool call sometimes outputs raw format instead of being parsed:
 ```
 mcp_discover[ARGS]{"pattern": "*file*"}
 ```
 
-**Expected:** Tool should execute, showing:
-```
-🔧 Executing tool 'mcp_discover'
-   Arguments: pattern: *file*
-```
+**Root Cause:** Model may not output `[TOOL_CALLS]` prefix consistently.
 
-**Root Cause:** Model may not output `[TOOL_CALLS]` prefix consistently. The ministral parser requires:
-```
-[TOOL_CALLS]toolname[ARGS]{"arg": "value"}
-```
+**Solution Implemented:**
+1. ✅ Added exact format specification to JIT context (da4db323)
+2. ✅ Added `looksLikeFailedToolCall()` detection in execution loop (8ee6c90c)
+3. ✅ Auto-retry with format correction when malformed tool call detected
+4. ✅ Streaming suppression on retry rounds to hide failed attempts
 
-**Observations from logs:**
-- `"No tools called, conversation complete" round=0 content_length=39`
-- Model generated 39 chars of content with no detected tool call
-- Second attempt ("try once more") worked correctly
-
-**Potential Fixes:**
-1. Make parser more lenient (detect `toolname[ARGS]` without prefix)
-2. Improve system prompt to reinforce correct format
-3. Add format examples to JIT context injection
+**How it works:**
+- Execution loop detects pattern `toolname[ARGS]{...}` in content
+- Adds failed attempt to message history with correction prompt
+- Retries with `suppressStreaming=true` to hide retry output
+- Model receives: "Please use the exact format: [TOOL_CALLS]tool_name[ARGS]{...}"
 
 ---
 
@@ -95,50 +92,46 @@ Result: ENOENT: no such file or directory, open '/home/velvetm/*'
 
 ## Issue 4: Raw Tool Call Format Leaking to Output
 
-**Symptom:** After tool execution, raw format appears in response:
-```
-✅ Result:
-Found 5 tools matching '*file*':
-...
+**Status: ✅ PARTIALLY FIXED** (commit 8ee6c90c)
 
-mcp_discover[ARGS]{"pattern": "*file*"}   <-- This shouldn't appear
-```
+**Symptom:** After tool execution, raw format appears in response.
 
-**Root Cause:** Model continues generating after tool call, echoing the format as "explanation."
+**Solution Implemented:**
+1. ✅ Added `suppressStreaming` parameter to `executeCompletionWithTools`
+2. ✅ Track `retryingFailedToolCall` state in execution loop
+3. ✅ Suppress streaming output during retry rounds
 
-**Parser behavior:**
-1. Parser extracts `[TOOL_CALLS]mcp_discover[ARGS]{...}` as tool call
-2. Transitions back to content collection state
-3. Model generates more text including the format
-4. This passes through as content
+**Current behavior:**
+- First malformed attempt may still be visible (streamed before detection)
+- Subsequent retry attempts are fully suppressed
+- Clean output on successful tool calls
 
-**Potential Fixes:**
-1. Filter output matching `toolname[ARGS]{...}` pattern
-2. Stop generation after tool call detected
-3. Post-process response to remove tool call echoes
+**Remaining work (optional):**
+- Could buffer first response to suppress initial failed attempt
+- Would require changes to streaming architecture
 
 ---
 
 ## Issue 5: No Automatic Multi-Pattern Discovery
 
+**Status: ✅ ADDRESSED** (commit da4db323)
+
 **Symptom:** User asks to "list files and read them" but model only discovers read tools.
 
-**Current Flow:**
-1. Model calls `mcp_discover("*file*")`
-2. Gets read/write tools
-3. Doesn't realize it needs `list_directory`
-4. Fails to complete task
+**Solution Implemented:**
+1. ✅ Added multi-step guidance in JIT context
+2. ✅ Context now instructs: "If a task involves multiple types of operations, call mcp_discover multiple times with different patterns"
+3. ✅ Provides workflow example showing sequential discovery
 
-**Ideal Flow:**
-1. Model analyzes task: needs list + read
-2. Calls `mcp_discover("*list*")` → gets `list_directory`
-3. Calls `mcp_discover("*file*")` → gets read/write tools
-4. Uses both to complete task
+**JIT context now includes:**
+```
+MULTI-STEP TASKS: If a task involves multiple types of operations
+(e.g., "list files and read them"), call mcp_discover multiple times
+with different patterns to find all needed tools BEFORE attempting
+the operations.
 
-**Potential Fixes:**
-1. Smarter system prompt guiding multi-pattern discovery
-2. Automatic "essential tools" pre-discovery
-3. Task analysis before discovery
+Common patterns: "*file*", "*directory*", "*list*", "*search*", "*git*"
+```
 
 ---
 
@@ -158,21 +151,46 @@ context.WriteString(`You have access to external tools via MCP...`)
 
 ---
 
-## Testing Checklist
+## New Feature: OpenAI Endpoint MCP Support
 
-- [ ] First request parses tool call correctly
-- [ ] Discovery returns essential tools (list, search, read, write)
-- [ ] Model uses correct tools for directory listing
-- [ ] No raw tool format in output
-- [ ] Multi-round tool usage works
-- [ ] Discovery results persist across rounds
+**Status: ✅ IMPLEMENTED** (commit d614b4ce)
+
+MCP is now available via the OpenAI compatibility endpoint `/v1/chat/completions`:
+
+```json
+{
+  "model": "ministral-3:14b",
+  "messages": [...],
+  "mcp_servers": [
+    {
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"]
+    }
+  ],
+  "tools_path": "/home/user/Desktop",
+  "jit_max_tools": 10
+}
+```
 
 ---
 
-## Priority Order
+## Testing Checklist
+
+- [x] First request parses tool call correctly (with auto-retry)
+- [ ] Discovery returns essential tools (list, search, read, write)
+- [ ] Model uses correct tools for directory listing
+- [x] No raw tool format in output (suppressed on retry)
+- [x] Multi-round tool usage works
+- [x] Discovery results persist across rounds
+- [x] OpenAI endpoint supports MCP parameters
+
+---
+
+## Priority Order (Updated)
 
 1. **High:** Issue 2 (tool limit) - blocking basic functionality
 2. **High:** Issue 3 (wrong tools) - consequence of Issue 2
-3. **Medium:** Issue 1 (parser inconsistency) - intermittent
-4. **Medium:** Issue 4 (format leaking) - cosmetic but confusing
-5. **Low:** Issue 5 (multi-pattern) - enhancement
+3. ~~**Medium:** Issue 1 (parser inconsistency)~~ ✅ FIXED
+4. ~~**Medium:** Issue 4 (format leaking)~~ ✅ PARTIALLY FIXED
+5. ~~**Low:** Issue 5 (multi-pattern)~~ ✅ ADDRESSED

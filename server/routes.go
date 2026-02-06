@@ -1942,10 +1942,41 @@ func toolCallId() string {
 	return "call_" + strings.ToLower(string(b))
 }
 
+// looksLikeFailedToolCall checks if content appears to be a malformed tool call attempt.
+// This detects when the model output something resembling a tool call but the parser
+// didn't recognize it (e.g., missing [TOOL_CALLS] prefix for ministral format).
+func looksLikeFailedToolCall(content string) bool {
+	// Check for common tool call patterns without proper prefix
+	// Pattern: word[ARGS]{ or word[ARGS] {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return false
+	}
+
+	// Look for toolname[ARGS]{...} pattern
+	argsIdx := strings.Index(content, "[ARGS]")
+	if argsIdx > 0 && argsIdx < 50 { // Tool name should be reasonably short
+		// Check that there's a potential tool name before [ARGS]
+		potentialName := strings.TrimSpace(content[:argsIdx])
+		if len(potentialName) > 0 && !strings.ContainsAny(potentialName, " \t\n") {
+			// Check for JSON object after [ARGS]
+			afterArgs := content[argsIdx+6:] // len("[ARGS]") = 6
+			afterArgs = strings.TrimSpace(afterArgs)
+			if strings.HasPrefix(afterArgs, "{") {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // executeCompletionWithTools executes a completion and collects the full response
 // This is a synchronous wrapper around the async completion callback
 // When suppressDone is true, the Done flag is not sent to the client channel
 // (used for intermediate rounds in multi-round tool execution)
+// When suppressStreaming is true, content is not streamed to the client
+// (used for retry rounds after failed tool call detection)
 func (s *Server) executeCompletionWithTools(
 	ctx context.Context,
 	r llm.LlamaServer,
@@ -1961,6 +1992,7 @@ func (s *Server) executeCompletionWithTools(
 	checkpointLoaded time.Time,
 	truncate bool,
 	suppressDone bool,
+	suppressStreaming bool,
 ) (*CompletionResult, error) {
 	result := &CompletionResult{}
 	done := make(chan error, 1)
@@ -2046,9 +2078,11 @@ func (s *Server) executeCompletionWithTools(
 				result.ToolCalls = accumulatedToolCalls
 			}
 
-			// Stream to client if there's content to stream
-			if res.Message.Content != "" || res.Message.Thinking != "" || len(res.Message.ToolCalls) > 0 || resp.Done || len(res.Logprobs) > 0 {
-				ch <- res
+			// Stream to client if there's content to stream (unless suppressed for retry)
+			if !suppressStreaming {
+				if res.Message.Content != "" || res.Message.Thinking != "" || len(res.Message.ToolCalls) > 0 || resp.Done || len(res.Logprobs) > 0 {
+					ch <- res
+				}
 			}
 
 			if resp.Done {
@@ -2087,7 +2121,7 @@ func (s *Server) executeCompletionWithTools(
 				// don't return, fall through to send
 			} else {
 				// Send logprobs while content is being buffered by the parser for tool calls
-				if len(res.Logprobs) > 0 && !resp.Done {
+				if len(res.Logprobs) > 0 && !resp.Done && !suppressStreaming {
 					logprobRes := res
 					logprobRes.Message.Content = ""
 					logprobRes.Message.ToolCalls = nil
@@ -2105,7 +2139,9 @@ func (s *Server) executeCompletionWithTools(
 						result.Content = toolParser.Content()
 					}
 					result.Done = true
-					ch <- res
+					if !suppressStreaming {
+						ch <- res
+					}
 					done <- nil
 				}
 				return
@@ -2114,8 +2150,10 @@ func (s *Server) executeCompletionWithTools(
 			result.Content += res.Message.Content
 		}
 
-		// Stream to client
-		ch <- res
+		// Stream to client (unless suppressed for retry)
+		if !suppressStreaming {
+			ch <- res
+		}
 
 		if resp.Done {
 			// If we accumulated tool calls, set them in result
@@ -2505,6 +2543,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 		// MAIN LOOP - Multi-round execution for tool calling
 		var round int
+		var retryingFailedToolCall bool // Track if we're retrying after failed tool call detection
 		for round = 0; round < maxRounds; round++ {
 			slog.Debug("Starting tool round", "round", round, "messages", len(currentMsgs), "tools", len(processedTools))
 
@@ -2551,7 +2590,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			// might call tools (which we need to handle even if just to return errors)
 			// We'll send Done: true after the loop completes
 			suppressDone := true
-			slog.Debug("Calling executeCompletionWithTools", "round", round, "prompt_len", len(prompt), "suppress_done", suppressDone)
+			slog.Debug("Calling executeCompletionWithTools", "round", round, "prompt_len", len(prompt), "suppress_done", suppressDone, "suppress_streaming", retryingFailedToolCall)
 			completionResult, err := s.executeCompletionWithTools(
 				c.Request.Context(),
 				r,
@@ -2567,6 +2606,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				checkpointLoaded,
 				truncate,
 				suppressDone,
+				retryingFailedToolCall, // Suppress streaming on retry after failed tool call
 			)
 			
 			if err != nil {
@@ -2582,11 +2622,37 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 			// Check if model called tools
 			if len(completionResult.ToolCalls) == 0 {
+				// Check if content looks like a failed tool call attempt (model stopped expecting execution)
+				if looksLikeFailedToolCall(completionResult.Content) {
+					slog.Warn("Detected failed tool call attempt, re-prompting",
+						"round", round,
+						"content", completionResult.Content)
+
+					// Add the failed attempt to history
+					currentMsgs = append(currentMsgs, api.Message{
+						Role:    "assistant",
+						Content: completionResult.Content,
+					})
+
+					// Add correction prompt
+					currentMsgs = append(currentMsgs, api.Message{
+						Role:    "user",
+						Content: "Your tool call was not recognized. Please use the exact format: [TOOL_CALLS]tool_name[ARGS]{\"argument\": \"value\"}",
+					})
+
+					// Suppress streaming on next retry
+					retryingFailedToolCall = true
+					continue // Retry with correction
+				}
+
 				// No tools called - conversation is complete
 				slog.Info("No tools called, conversation complete", "round", round, "content_length", len(completionResult.Content))
 				break // Exit the loop - we're done
 			}
-			
+
+			// Tool call succeeded - clear retry flag
+			retryingFailedToolCall = false
+
 			// Validate tool calls are not empty or malformed
 			validToolCalls := 0
 			for _, tc := range completionResult.ToolCalls {
@@ -2596,12 +2662,12 @@ func (s *Server) ChatHandler(c *gin.Context) {
 					slog.Warn("Invalid tool call detected", "round", round, "tool", tc)
 				}
 			}
-			
+
 			if validToolCalls == 0 {
 				slog.Warn("No valid tool calls found, exiting", "round", round)
 				break
 			}
-			
+
 			// Model called tools - execute them if we have an MCP manager
 			if mcpManager != nil {
 				slog.Debug("MCP tool execution starting",

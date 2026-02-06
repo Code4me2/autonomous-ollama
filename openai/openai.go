@@ -114,6 +114,10 @@ type ChatCompletionRequest struct {
 	Logprobs         *bool           `json:"logprobs"`
 	TopLogprobs      int             `json:"top_logprobs"`
 	DebugRenderOnly  bool            `json:"_debug_render_only"`
+	// Ollama MCP extensions
+	MCPServers  []api.MCPServerConfig `json:"mcp_servers,omitempty"`
+	ToolsPath   string                `json:"tools_path,omitempty"`
+	JITMaxTools int                   `json:"jit_max_tools,omitempty"`
 }
 
 type ChatCompletion struct {
@@ -611,6 +615,10 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 		Logprobs:        r.Logprobs != nil && *r.Logprobs,
 		TopLogprobs:     r.TopLogprobs,
 		DebugRenderOnly: r.DebugRenderOnly,
+		// MCP extensions
+		MCPServers:  r.MCPServers,
+		ToolsPath:   r.ToolsPath,
+		JITMaxTools: r.JITMaxTools,
 	}, nil
 }
 

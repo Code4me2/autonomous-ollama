@@ -664,19 +664,41 @@ type Logprob struct {
 	TopLogprobs []TokenLogprob `json:"top_logprobs,omitempty"`
 }
 
+// MCPTransport specifies the transport type for MCP communication
+type MCPTransport string
+
+const (
+	// MCPTransportStdio uses stdin/stdout pipes to a local process (default)
+	MCPTransportStdio MCPTransport = "stdio"
+	// MCPTransportWebSocket uses WebSocket for remote server communication
+	MCPTransportWebSocket MCPTransport = "websocket"
+)
+
 // MCPServerConfig represents configuration for an MCP (Model Context Protocol) server
 type MCPServerConfig struct {
 	// Name is a unique identifier for the MCP server
 	Name string `json:"name"`
 
-	// Command is the executable command to start the MCP server
-	Command string `json:"command"`
+	// Transport specifies the communication transport (default: "stdio")
+	// Supported values: "stdio", "websocket"
+	Transport MCPTransport `json:"transport,omitempty"`
 
-	// Args are optional command-line arguments for the MCP server
+	// Command is the executable command to start the MCP server (stdio transport only)
+	Command string `json:"command,omitempty"`
+
+	// Args are optional command-line arguments for the MCP server (stdio transport only)
 	Args []string `json:"args,omitempty"`
 
-	// Env are optional environment variables for the MCP server
+	// Env are optional environment variables for the MCP server (stdio transport only)
 	Env map[string]string `json:"env,omitempty"`
+
+	// URL is the WebSocket endpoint for remote MCP servers (websocket transport only)
+	// Example: "ws://localhost:8080/mcp" or "wss://mcp.example.com/ws"
+	URL string `json:"url,omitempty"`
+
+	// Headers are optional HTTP headers for WebSocket connection (websocket transport only)
+	// Useful for authentication tokens
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // ChatResponse is the response returned by [Client.Chat]. Its fields are

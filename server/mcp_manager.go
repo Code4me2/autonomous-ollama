@@ -11,10 +11,11 @@ import (
 
 // MCPManager manages multiple MCP server connections and provides tool execution services.
 // All servers use lazy/JIT connection - servers are registered but not connected until needed.
+// Supports both stdio (local process) and websocket (remote) transports.
 type MCPManager struct {
 	mu          sync.RWMutex
-	clients     map[string]*MCPClient
-	toolRouting map[string]string // tool name -> client name mapping
+	clients     map[string]MCPClientInterface // Supports both stdio and websocket clients
+	toolRouting map[string]string             // tool name -> client name mapping
 	maxClients  int
 
 	// Lazy connection support (always enabled - JIT is the only mode)
@@ -48,7 +49,7 @@ func NewMCPManager(maxClients int, maxToolsPerDiscovery int) *MCPManager {
 		maxToolsPerDiscovery = 5 // Default
 	}
 	return &MCPManager{
-		clients:              make(map[string]*MCPClient),
+		clients:              make(map[string]MCPClientInterface),
 		toolRouting:          make(map[string]string),
 		pendingConfigs:       make(map[string]api.MCPServerConfig),
 		maxClients:           maxClients,
@@ -93,8 +94,12 @@ func (m *MCPManager) EnsureConnected(serverName string) error {
 		return fmt.Errorf("server '%s' not configured", serverName)
 	}
 
-	// Connect now
-	client := NewMCPClient(config.Name, config.Command, config.Args, config.Env)
+	// Connect now using appropriate transport
+	client := NewMCPClientFromConfig(config)
+	if err := client.Start(); err != nil {
+		client.Close()
+		return fmt.Errorf("failed to start: %w", err)
+	}
 	if err := client.Initialize(); err != nil {
 		client.Close()
 		return fmt.Errorf("failed to initialize: %w", err)
@@ -167,9 +172,14 @@ func (m *MCPManager) AddServer(config api.MCPServerConfig) error {
 		return fmt.Errorf("invalid MCP server configuration: %w", err)
 	}
 
-	// Create and initialize the MCP client
-	client := NewMCPClient(config.Name, config.Command, config.Args, config.Env)
-	
+	// Create and initialize the MCP client using appropriate transport
+	client := NewMCPClientFromConfig(config)
+
+	if err := client.Start(); err != nil {
+		client.Close()
+		return fmt.Errorf("failed to start MCP server '%s': %w", config.Name, err)
+	}
+
 	if err := client.Initialize(); err != nil {
 		client.Close()
 		return fmt.Errorf("failed to initialize MCP server '%s': %w", config.Name, err)
@@ -228,10 +238,10 @@ func (m *MCPManager) GetAllTools() []api.Tool {
 
 	var allTools []api.Tool
 	
-	for _, client := range m.clients {
+	for clientName, client := range m.clients {
 		tools, err := client.ListTools()
 		if err != nil {
-			slog.Warn("Failed to get tools from MCP client", "name", client.name, "error", err)
+			slog.Warn("Failed to get tools from MCP client", "name", clientName, "error", err)
 			continue
 		}
 		allTools = append(allTools, tools...)
@@ -523,7 +533,7 @@ func (m *MCPManager) Close() error {
 	}
 
 	// Clear all data
-	m.clients = make(map[string]*MCPClient)
+	m.clients = make(map[string]MCPClientInterface)
 	m.toolRouting = make(map[string]string)
 
 	if len(errs) > 0 {

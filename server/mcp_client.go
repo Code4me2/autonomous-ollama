@@ -188,7 +188,7 @@ func (c *MCPClient) Start() error {
 	defer c.mu.Unlock()
 
 	if c.cmd != nil {
-		return errors.New("MCP client already started")
+		return nil // Already started, idempotent
 	}
 
 	// Handle commands that might have spaces (like "pnpm dlx")

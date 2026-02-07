@@ -175,6 +175,46 @@ MCP is now available via the OpenAI compatibility endpoint `/v1/chat/completions
 
 ---
 
+## New Feature: WebSocket Transport for Remote MCP Servers
+
+**Status: ✅ IMPLEMENTED** (commit e2a72140)
+
+MCP servers can now be accessed remotely via WebSocket transport. This enables:
+- Running MCP servers on remote machines (e.g., over Tailscale)
+- Persistent bidirectional connections with low latency
+- Secure connections with header-based authentication
+
+**Configuration:**
+```json
+{
+  "mcp_servers": [
+    {
+      "name": "remote-server",
+      "transport": "websocket",
+      "url": "ws://server.tailnet.ts.net:8080/mcp",
+      "headers": {
+        "Authorization": "Bearer your-token"
+      }
+    }
+  ]
+}
+```
+
+**Transport options:**
+- `stdio` (default): Local process via stdin/stdout
+- `websocket`: Remote server via WebSocket
+
+**Files added:**
+- `server/mcp_client_interface.go` - Transport abstraction interface
+- `server/mcp_client_ws.go` - WebSocket client implementation
+
+**Benefits for Tailscale:**
+- WireGuard encryption at network layer
+- No additional TLS required within tailnet
+- Sub-millisecond latency within network
+
+---
+
 ## Testing Checklist
 
 - [x] First request parses tool call correctly (with auto-retry)

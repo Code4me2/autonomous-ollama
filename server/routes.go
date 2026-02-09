@@ -28,6 +28,7 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"golang.org/x/image/webp"
 	"golang.org/x/sync/errgroup"
 
@@ -2027,11 +2028,19 @@ func (s *Server) executeCompletionWithTools(
 		// (used for intermediate rounds in multi-round tool execution)
 		clientDone := resp.Done && !suppressDone
 
+		// Determine task status for A2A compatibility
+		taskStatus := "working"
+		if clientDone {
+			taskStatus = "completed"
+		}
+
 		res := api.ChatResponse{
-			Model:     req.Model,
-			CreatedAt: time.Now().UTC(),
-			Message:   api.Message{Role: "assistant", Content: resp.Content},
-			Done:      clientDone,
+			Model:      req.Model,
+			CreatedAt:  time.Now().UTC(),
+			Message:    api.Message{Role: "assistant", Content: resp.Content},
+			Done:       clientDone,
+			TaskID:     req.TaskID,
+			TaskStatus: taskStatus,
 			Metrics: api.Metrics{
 				PromptEvalCount:    resp.PromptEvalCount,
 				PromptEvalDuration: resp.PromptEvalDuration,
@@ -2202,6 +2211,11 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		return
 	}
 
+	// Generate task ID for A2A compatibility (use provided or create new)
+	if req.TaskID == "" {
+		req.TaskID = uuid.New().String()
+	}
+
 	name := model.ParseName(req.Model)
 	if !name.IsValid() {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "model is required"})
@@ -2242,6 +2256,8 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			Message:    api.Message{Role: "assistant"},
 			Done:       true,
 			DoneReason: "unload",
+			TaskID:     req.TaskID,
+			TaskStatus: "completed",
 		})
 		return
 	}
@@ -2446,6 +2462,8 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			Message:    api.Message{Role: "assistant"},
 			Done:       true,
 			DoneReason: "load",
+			TaskID:     req.TaskID,
+			TaskStatus: "completed",
 		})
 		return
 	}
@@ -2487,8 +2505,10 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	// If debug mode is enabled, return the rendered template instead of calling the model
 	if req.DebugRenderOnly {
 		c.JSON(http.StatusOK, api.ChatResponse{
-			Model:     req.Model,
-			CreatedAt: time.Now().UTC(),
+			Model:      req.Model,
+			CreatedAt:  time.Now().UTC(),
+			TaskID:     req.TaskID,
+			TaskStatus: "completed",
 			DebugInfo: &api.DebugInfo{
 				RenderedTemplate: prompt,
 				ImageCount:       len(images),
@@ -2724,7 +2744,9 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				if len(discoveryResults) > 0 {
 					// Send discovery results to client for visibility
 					ch <- api.ChatResponse{
-						Model: req.Model,
+						Model:      req.Model,
+						TaskID:     req.TaskID,
+						TaskStatus: "working",
 						Message: api.Message{
 							Role:        "assistant",
 							ToolResults: discoveryResults,
@@ -2841,7 +2863,9 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				// Send tool results to client for display
 				if len(toolResultsForDisplay) > 0 {
 					ch <- api.ChatResponse{
-						Model: req.Model,
+						Model:      req.Model,
+						TaskID:     req.TaskID,
+						TaskStatus: "working",
 						Message: api.Message{
 							Role:        "assistant",
 							ToolResults: toolResultsForDisplay,
@@ -2872,7 +2896,9 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				// Send error results to client for display
 				if len(errorResults) > 0 {
 					ch <- api.ChatResponse{
-						Model: req.Model,
+						Model:      req.Model,
+						TaskID:     req.TaskID,
+						TaskStatus: "working",
 						Message: api.Message{
 							Role:        "assistant",
 							ToolCalls:   completionResult.ToolCalls,
@@ -2918,6 +2944,8 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			Message:    api.Message{Role: "assistant"},
 			Done:       true,
 			DoneReason: "stop",
+			TaskID:     req.TaskID,
+			TaskStatus: "completed",
 		}
 	}()
 

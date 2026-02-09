@@ -231,6 +231,10 @@ type ChatRequest struct {
 	// ToolsPath is the file path passed via --tools flag in interactive mode.
 	// Used to generate consistent session IDs for tool continuity.
 	ToolsPath string `json:"tools_path,omitempty"`
+
+	// TaskID allows tracking a specific task/request. If not provided,
+	// a new task ID is generated. Used for A2A protocol compatibility.
+	TaskID string `json:"task_id,omitempty"`
 }
 
 type Tools []Tool
@@ -734,6 +738,14 @@ type ChatResponse struct {
 	// ToolResults contains the raw results from MCP tool executions,
 	// only included when IncludeToolResults is true in the request.
 	ToolResults []ToolResult `json:"tool_results,omitempty"`
+
+	// TaskID is the unique identifier for this task/request.
+	// Used for A2A protocol compatibility and async task tracking.
+	TaskID string `json:"task_id,omitempty"`
+
+	// TaskStatus indicates the current state of the task.
+	// Values: "working", "completed", "failed"
+	TaskStatus string `json:"task_status,omitempty"`
 
 	Metrics
 }

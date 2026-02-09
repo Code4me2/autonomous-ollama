@@ -1,0 +1,42 @@
+[Unit]
+Description=MCP WebSocket Bridge for Remote Tool Access
+Documentation=https://github.com/ollama/ollama/tree/main/examples/remote-mcp
+After=network.target tailscaled.service
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+Group=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/mcp-bridge
+
+# MCP Bridge configuration
+Environment=MCP_PORT=8080
+Environment=MCP_COMMAND=npx
+Environment=MCP_ARGS=["-y", "@modelcontextprotocol/server-filesystem", "/home/YOUR_USERNAME/data"]
+
+# Optional: Enable authentication
+# Environment=MCP_AUTH_TOKEN=your-secret-token-here
+
+# Node.js execution
+ExecStart=/usr/bin/node bridge.js
+
+# Restart policy
+Restart=always
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Security hardening (optional but recommended)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/YOUR_USERNAME/data
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-bridge
+
+[Install]
+WantedBy=multi-user.target

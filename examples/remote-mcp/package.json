@@ -1,0 +1,25 @@
+{
+  "name": "mcp-websocket-bridge",
+  "version": "1.0.0",
+  "description": "WebSocket bridge for exposing MCP servers over the network",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js",
+    "start:auth": "node bridge.js",
+    "test": "echo \"Send test requests to ws://localhost:8080\""
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "websocket",
+    "ollama",
+    "tailscale"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.14.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

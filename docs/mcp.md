@@ -74,17 +74,18 @@ curl -X POST http://localhost:11434/api/chat \
                                         │   (mcp_manager)     │
                                         │                     │
                                         │  Multi-client mgmt  │
-                                        │  Tool execution     │
+                                        │  JIT discovery      │
                                         └─────────────────────┘
                                                   │
-                                                  ▼
-                                        ┌─────────────────────┐
-                                        │      MCPClient      │
-                                        │    (mcp_client)     │
-                                        │                     │
-                                        │  Single JSON-RPC    │
-                                        │  connection         │
-                                        └─────────────────────┘
+                                    ┌─────────────┴─────────────┐
+                                    ▼                           ▼
+                          ┌─────────────────┐         ┌─────────────────┐
+                          │    MCPClient    │         │MCPWebSocketClient│
+                          │  (mcp_client)   │         │ (mcp_client_ws) │
+                          │                 │         │                 │
+                          │  stdio transport│         │   WebSocket     │
+                          │  (local process)│         │ (remote server) │
+                          └─────────────────┘         └─────────────────┘
 ```
 
 ## Auto-Enable Configuration
@@ -208,9 +209,12 @@ With this configuration:
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | string | Unique identifier for the server |
-| `command` | string | Executable to run |
-| `args` | []string | Command-line arguments |
-| `env` | map | Environment variables |
+| `transport` | string | Transport type: `"stdio"` (default) or `"websocket"` |
+| `command` | string | Executable to run (stdio transport) |
+| `args` | []string | Command-line arguments (stdio transport) |
+| `env` | map | Environment variables (stdio transport) |
+| `url` | string | WebSocket URL (websocket transport) |
+| `headers` | map | HTTP headers for WebSocket connection |
 
 ### Response Format
 
@@ -239,11 +243,22 @@ With this configuration:
     }
   ],
   "done": true,
-  "done_reason": "stop"
+  "done_reason": "stop",
+  "task_id": "550e8400-e29b-41d4-a716-446655440000",
+  "task_status": "completed"
 }
 ```
 
 > **Note:** `tool_results` is only included when `include_tool_results: true` in the request.
+
+**A2A Task Tracking Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `task_id` | string | Unique task identifier (auto-generated if not provided in request) |
+| `task_status` | string | Task state: `"working"` during execution, `"completed"` when done |
+
+These fields enable A2A (Agent-to-Agent) protocol compatibility. You can provide a `task_id` in the request to track specific tasks.
 
 ### Complete Example
 
@@ -505,12 +520,101 @@ MCP works best with models that support tool calling:
 - Llama 3.1+ with tool support
 - Other models with JSON tool call output
 
+## WebSocket Transport (Remote MCP Servers)
+
+MCP servers can be accessed remotely via WebSocket transport, enabling tools on remote machines (e.g., over Tailscale).
+
+### Configuration
+
+```json
+{
+  "mcp_servers": [
+    {
+      "name": "remote-server",
+      "transport": "websocket",
+      "url": "ws://server.tailnet.ts.net:8080/mcp",
+      "headers": {
+        "Authorization": "Bearer your-token"
+      }
+    }
+  ]
+}
+```
+
+### Mixed Local and Remote
+
+```json
+{
+  "mcp_servers": [
+    {
+      "name": "local-fs",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home"]
+    },
+    {
+      "name": "remote-git",
+      "transport": "websocket",
+      "url": "ws://git-server.tailnet.ts.net:8080/mcp"
+    }
+  ]
+}
+```
+
+### Server-Side Setup
+
+You need an MCP server that speaks WebSocket. Create a bridge for stdio servers:
+
+```javascript
+// mcp-ws-bridge.js
+const WebSocket = require('ws');
+const { spawn } = require('child_process');
+
+const wss = new WebSocket.Server({ port: 8080 });
+
+wss.on('connection', (ws) => {
+  const mcp = spawn('npx', ['-y', '@modelcontextprotocol/server-filesystem', '/data']);
+
+  ws.on('message', (data) => mcp.stdin.write(data + '\n'));
+  mcp.stdout.on('data', (data) => ws.send(data.toString()));
+  ws.on('close', () => mcp.kill());
+});
+
+console.log('MCP WebSocket bridge on ws://0.0.0.0:8080');
+```
+
+### Tailscale Integration
+
+WebSocket over Tailscale provides:
+- WireGuard encryption at network layer
+- No additional TLS required within tailnet
+- Sub-millisecond latency within network
+
+## OpenAI Compatibility Endpoint
+
+MCP is also available via the OpenAI-compatible endpoint:
+
+```bash
+curl -X POST http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen2.5:7b",
+    "messages": [{"role": "user", "content": "List the files"}],
+    "mcp_servers": [{
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }],
+    "tools_path": "/tmp",
+    "jit_max_tools": 10
+  }'
+```
+
 ## Limitations
 
-- **Transport**: stdio only (no HTTP/WebSocket)
 - **Protocol**: MCP 1.0
 - **Concurrency**: Max 10 parallel MCP servers
 - **Platform**: Linux/macOS (Windows untested)
+- **WebSocket timeout**: 60 seconds per tool call (configurable per-server planned)
 
 ## Troubleshooting
 

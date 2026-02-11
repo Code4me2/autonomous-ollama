@@ -280,7 +280,11 @@ func ToChatCompletion(id string, r api.ChatResponse) ChatCompletion {
 		Choices: []Choice{{
 			Index:   0,
 			Message: Message{Role: r.Message.Role, Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
-			FinishReason: func(reason string) *string {
+			FinishReason: func(reason string, taskStatus string) *string {
+				// For MCP internal execution, only emit finish_reason when truly complete
+				if taskStatus == "working" {
+					return nil
+				}
 				if len(toolCalls) > 0 {
 					reason = "tool_calls"
 				}
@@ -288,7 +292,7 @@ func ToChatCompletion(id string, r api.ChatResponse) ChatCompletion {
 					return &reason
 				}
 				return nil
-			}(r.DoneReason),
+			}(r.DoneReason, r.TaskStatus),
 			Logprobs: logprobs,
 		}}, Usage: ToUsage(r),
 		DebugInfo: r.DebugInfo,
@@ -313,18 +317,22 @@ func ToChunk(id string, r api.ChatResponse, toolCallSent bool) ChatCompletionChu
 		Choices: []ChunkChoice{{
 			Index: 0,
 			Delta: Message{Role: "assistant", Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
-			FinishReason: func(reason string) *string {
+			FinishReason: func(reason string, taskStatus string) *string {
+				// For MCP internal execution, only emit finish_reason when truly complete
+				// TaskStatus="working" means MCP loop is still running, don't signal done
+				// TaskStatus="completed" or empty (non-MCP) means we can emit finish_reason
+				if taskStatus == "working" {
+					return nil
+				}
 				if len(reason) > 0 {
 					// Only use "tool_calls" if THIS chunk contains tool calls
-					// Don't use toolCallSent - that causes text-only terminal chunks
-					// to incorrectly report finish_reason as "tool_calls"
 					if len(toolCalls) > 0 {
 						return &finishReasonToolCalls
 					}
 					return &reason
 				}
 				return nil
-			}(r.DoneReason),
+			}(r.DoneReason, r.TaskStatus),
 			Logprobs: logprobs,
 		}},
 	}

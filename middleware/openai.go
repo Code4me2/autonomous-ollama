@@ -25,6 +25,7 @@ type ChatWriter struct {
 	streamOptions *openai.StreamOptions
 	id            string
 	toolCallSent  bool
+	doneSent      bool // Track if [DONE] was already sent to prevent duplicates
 	BaseWriter
 }
 
@@ -90,7 +91,8 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 			return 0, err
 		}
 
-		if chatResponse.Done {
+		if chatResponse.Done && !w.doneSent {
+			w.doneSent = true
 			if w.streamOptions != nil && w.streamOptions.IncludeUsage {
 				u := openai.ToUsage(chatResponse)
 				c.Usage = &u

@@ -315,7 +315,10 @@ func ToChunk(id string, r api.ChatResponse, toolCallSent bool) ChatCompletionChu
 			Delta: Message{Role: "assistant", Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
 			FinishReason: func(reason string) *string {
 				if len(reason) > 0 {
-					if toolCallSent || len(toolCalls) > 0 {
+					// Only use "tool_calls" if THIS chunk contains tool calls
+					// Don't use toolCallSent - that causes text-only terminal chunks
+					// to incorrectly report finish_reason as "tool_calls"
+					if len(toolCalls) > 0 {
 						return &finishReasonToolCalls
 					}
 					return &reason

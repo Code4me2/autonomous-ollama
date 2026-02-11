@@ -2067,6 +2067,13 @@ func (s *Server) executeCompletionWithTools(
 				return
 			}
 
+			// Assign IDs to tool calls that don't have them (Quirk 4 fix)
+			for i := range toolCalls {
+				if toolCalls[i].ID == "" {
+					toolCalls[i].ID = toolCallId()
+				}
+			}
+
 			res.Message.Content = content
 			res.Message.Thinking = thinking
 			res.Message.ToolCalls = toolCalls
@@ -2118,6 +2125,12 @@ func (s *Server) executeCompletionWithTools(
 		// Handle tool parsing (for models without native tool support)
 		if len(req.Tools) > 0 && builtinParser == nil {
 			toolCalls, content := toolParser.Add(res.Message.Content)
+			// Assign IDs to tool calls that don't have them (Quirk 4 fix)
+			for i := range toolCalls {
+				if toolCalls[i].ID == "" {
+					toolCalls[i].ID = toolCallId()
+				}
+			}
 			if len(content) > 0 {
 				res.Message.Content = content
 				result.Content += content

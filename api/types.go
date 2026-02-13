@@ -674,8 +674,10 @@ type MCPTransport string
 const (
 	// MCPTransportStdio uses stdin/stdout pipes to a local process (default)
 	MCPTransportStdio MCPTransport = "stdio"
-	// MCPTransportWebSocket uses WebSocket for remote server communication
-	MCPTransportWebSocket MCPTransport = "websocket"
+	// MCPTransportHTTP uses streamable-http transport (POST to /mcp with streaming response)
+	MCPTransportHTTP MCPTransport = "http"
+	// MCPTransportStreamableHTTP is an alias for http transport
+	MCPTransportStreamableHTTP MCPTransport = "streamable-http"
 )
 
 // MCPServerConfig represents configuration for an MCP (Model Context Protocol) server
@@ -684,7 +686,7 @@ type MCPServerConfig struct {
 	Name string `json:"name"`
 
 	// Transport specifies the communication transport (default: "stdio")
-	// Supported values: "stdio", "websocket"
+	// Supported values: "stdio", "http", "streamable-http"
 	Transport MCPTransport `json:"transport,omitempty"`
 
 	// Command is the executable command to start the MCP server (stdio transport only)

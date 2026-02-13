@@ -741,24 +741,44 @@ func (m *MCPManager) validateServerConfig(config api.MCPServerConfig) error {
 		return fmt.Errorf("server name contains invalid characters")
 	}
 
-	// Validate command
-	if config.Command == "" {
-		return fmt.Errorf("command cannot be empty")
+	// Validation differs by transport type
+	transport := config.Transport
+	if transport == "" {
+		transport = api.MCPTransportStdio
 	}
-	
-	// Get security configuration
+
+	switch transport {
+	case api.MCPTransportHTTP, api.MCPTransportStreamableHTTP:
+		// Remote transports require URL
+		if config.URL == "" {
+			return fmt.Errorf("URL is required for %s transport", transport)
+		}
+		// Basic URL validation
+		if !strings.HasPrefix(config.URL, "http://") && !strings.HasPrefix(config.URL, "https://") {
+			return fmt.Errorf("URL must start with http:// or https://")
+		}
+		return nil // Remote transports don't need command validation
+
+	default:
+		// stdio transport requires command
+		if config.Command == "" {
+			return fmt.Errorf("command cannot be empty for stdio transport")
+		}
+	}
+
+	// Get security configuration (only for stdio transport)
 	securityConfig := GetSecurityConfig()
-	
+
 	// Check if command is allowed by security policy
 	if !securityConfig.IsCommandAllowed(config.Command) {
 		return fmt.Errorf("command '%s' is not allowed for security reasons", config.Command)
 	}
-	
+
 	// Validate command path (must be absolute or in PATH)
 	if strings.Contains(config.Command, "..") {
 		return fmt.Errorf("command path cannot contain '..'")
 	}
-	
+
 	// Validate arguments
 	for _, arg := range config.Args {
 		if strings.Contains(arg, "..") || strings.HasPrefix(arg, "-") && len(arg) > 50 {
@@ -769,7 +789,7 @@ func (m *MCPManager) validateServerConfig(config api.MCPServerConfig) error {
 			return fmt.Errorf("argument contains shell metacharacters: %s", arg)
 		}
 	}
-	
+
 	// Validate environment variables
 	for key := range config.Env {
 		if securityConfig.HasShellMetacharacters(key) {

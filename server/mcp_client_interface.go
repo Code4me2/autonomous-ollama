@@ -3,7 +3,7 @@ package server
 import "github.com/ollama/ollama/api"
 
 // MCPClientInterface defines the interface for MCP client implementations.
-// Both stdio and WebSocket transports implement this interface.
+// Supports stdio and streamable-http transports.
 type MCPClientInterface interface {
 	// Start initiates the connection to the MCP server
 	Start() error
@@ -25,7 +25,7 @@ type MCPClientInterface interface {
 }
 
 // NewMCPClientFromConfig creates an MCP client based on the server configuration.
-// It automatically selects the appropriate transport (stdio or websocket).
+// It automatically selects the appropriate transport (stdio or http).
 func NewMCPClientFromConfig(config api.MCPServerConfig, opts ...MCPClientOption) MCPClientInterface {
 	transport := config.Transport
 	if transport == "" {
@@ -33,8 +33,8 @@ func NewMCPClientFromConfig(config api.MCPServerConfig, opts ...MCPClientOption)
 	}
 
 	switch transport {
-	case api.MCPTransportWebSocket:
-		return NewMCPWebSocketClient(config.Name, config.URL, config.Headers)
+	case api.MCPTransportHTTP, api.MCPTransportStreamableHTTP:
+		return NewMCPHTTPClient(config.Name, config.URL, config.Headers)
 	default:
 		return NewMCPClient(config.Name, config.Command, config.Args, config.Env, opts...)
 	}

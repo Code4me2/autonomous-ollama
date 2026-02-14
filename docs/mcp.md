@@ -80,10 +80,10 @@ curl -X POST http://localhost:11434/api/chat \
                                     ┌─────────────┴─────────────┐
                                     ▼                           ▼
                           ┌─────────────────┐         ┌─────────────────┐
-                          │    MCPClient    │         │MCPWebSocketClient│
-                          │  (mcp_client)   │         │ (mcp_client_ws) │
+                          │    MCPClient    │         │  MCPHTTPClient  │
+                          │  (mcp_client)   │         │(mcp_client_http)│
                           │                 │         │                 │
-                          │  stdio transport│         │   WebSocket     │
+                          │  stdio transport│         │ HTTP transport  │
                           │  (local process)│         │ (remote server) │
                           └─────────────────┘         └─────────────────┘
 ```
@@ -209,12 +209,12 @@ With this configuration:
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | string | Unique identifier for the server |
-| `transport` | string | Transport type: `"stdio"` (default) or `"websocket"` |
+| `transport` | string | Transport type: `"stdio"` (default), `"http"`, or `"streamable-http"` |
 | `command` | string | Executable to run (stdio transport) |
 | `args` | []string | Command-line arguments (stdio transport) |
 | `env` | map | Environment variables (stdio transport) |
-| `url` | string | WebSocket URL (websocket transport) |
-| `headers` | map | HTTP headers for WebSocket connection |
+| `url` | string | HTTP URL for remote server (http/streamable-http transport) |
+| `headers` | map | HTTP headers for remote connection |
 
 ### Response Format
 
@@ -520,9 +520,9 @@ MCP works best with models that support tool calling:
 - Llama 3.1+ with tool support
 - Other models with JSON tool call output
 
-## WebSocket Transport (Remote MCP Servers)
+## HTTP Transport (Remote MCP Servers)
 
-MCP servers can be accessed remotely via WebSocket transport, enabling tools on remote machines (e.g., over Tailscale).
+MCP servers can be accessed remotely via HTTP transport (streamable-http), enabling tools on remote machines (e.g., over Tailscale).
 
 ### Configuration
 
@@ -531,8 +531,8 @@ MCP servers can be accessed remotely via WebSocket transport, enabling tools on 
   "mcp_servers": [
     {
       "name": "remote-server",
-      "transport": "websocket",
-      "url": "ws://server.tailnet.ts.net:8080/mcp",
+      "transport": "http",
+      "url": "http://server.tailnet.ts.net:8085/mcp",
       "headers": {
         "Authorization": "Bearer your-token"
       }
@@ -540,6 +540,10 @@ MCP servers can be accessed remotely via WebSocket transport, enabling tools on 
   ]
 }
 ```
+
+The `transport` field accepts:
+- `"http"` - HTTP POST with JSON-RPC
+- `"streamable-http"` - Alias for http (MCP spec terminology)
 
 ### Mixed Local and Remote
 
@@ -552,42 +556,108 @@ MCP servers can be accessed remotely via WebSocket transport, enabling tools on 
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home"]
     },
     {
-      "name": "remote-git",
-      "transport": "websocket",
-      "url": "ws://git-server.tailnet.ts.net:8080/mcp"
+      "name": "remote-calendar",
+      "transport": "http",
+      "url": "http://calendar-server.tailnet.ts.net:8085/mcp"
     }
   ]
 }
 ```
 
-### Server-Side Setup
+### How HTTP Transport Works
 
-You need an MCP server that speaks WebSocket. Create a bridge for stdio servers:
+1. Ollama sends JSON-RPC requests via HTTP POST to the MCP endpoint
+2. Server responds with JSON-RPC results
+3. Session IDs are tracked via `mcp-session-id` header
+4. Tool names are automatically prefixed with server name (e.g., `calendar:list_tasks`)
 
-```javascript
-// mcp-ws-bridge.js
-const WebSocket = require('ws');
-const { spawn } = require('child_process');
+### Example: Remote Calendar
 
-const wss = new WebSocket.Server({ port: 8080 });
-
-wss.on('connection', (ws) => {
-  const mcp = spawn('npx', ['-y', '@modelcontextprotocol/server-filesystem', '/data']);
-
-  ws.on('message', (data) => mcp.stdin.write(data + '\n'));
-  mcp.stdout.on('data', (data) => ws.send(data.toString()));
-  ws.on('close', () => mcp.kill());
-});
-
-console.log('MCP WebSocket bridge on ws://0.0.0.0:8080');
+```bash
+curl -X POST http://localhost:11434/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "ministral-3:14b",
+    "messages": [{"role": "user", "content": "List my tasks"}],
+    "mcp_servers": [{
+      "name": "calendar",
+      "transport": "http",
+      "url": "http://100.119.170.128:8085/mcp"
+    }],
+    "stream": false
+  }'
 ```
 
 ### Tailscale Integration
 
-WebSocket over Tailscale provides:
+HTTP over Tailscale provides:
 - WireGuard encryption at network layer
 - No additional TLS required within tailnet
-- Sub-millisecond latency within network
+- Low latency within network
+
+## A2A Bridge (Optional)
+
+For advanced multi-agent orchestration, you can use the **A2A Bridge** - a separate Python application that wraps Ollama with the A2A (Agent-to-Agent) protocol.
+
+### What A2A Bridge Adds
+
+| Feature | Native Ollama | With A2A Bridge |
+|---------|---------------|-----------------|
+| Tool execution | Synchronous | Sync + Async |
+| Task tracking | Basic (`task_id`) | Full lifecycle |
+| Agent discovery | None | `/.well-known/agent.json` |
+| Push notifications | None | HMAC-signed webhooks |
+| Multi-agent delegation | None | Manager → Worker pattern |
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    User / Application                        │
+└─────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              ▼                               ▼
+┌───────────────────────┐         ┌───────────────────────────┐
+│   Direct Ollama API   │         │      A2A Bridge           │
+│                       │         │                           │
+│  POST /api/chat       │         │  POST /a2a (JSON-RPC)     │
+│  - Sync tool calls    │         │  POST /mcp (tool calls)   │
+│  - JIT discovery      │         │  GET /.well-known/agent   │
+│  - Native MCP         │         │  POST /notifications/*    │
+│                       │         │                           │
+│  Use for: CLI tools,  │         │  Use for: Multi-agent,    │
+│  simple automation    │         │  async tasks, webhooks    │
+└───────────────────────┘         └───────────────────────────┘
+              │                               │
+              └───────────────┬───────────────┘
+                              ▼
+                    ┌─────────────────┐
+                    │     Ollama      │
+                    │   (MCP Engine)  │
+                    └─────────────────┘
+```
+
+### When to Use Each
+
+**Use Native Ollama (`ollama run --tools` or `/api/chat`):**
+- CLI interactions
+- Simple tool execution
+- Single-task automation
+- Direct API access
+
+**Use A2A Bridge:**
+- Multi-agent coordination (Manager → Workers)
+- Async task delegation with callbacks
+- Agent discovery and skill-based routing
+- Push notifications on task completion
+- Building agent networks
+
+### A2A Bridge Repository
+
+The A2A Bridge is maintained separately:
+- Repository: [github.com/Code4me2/agentic_flow](https://github.com/Code4me2/agentic_flow)
+- Features: Async delegation, push notifications, turn-boundary injection
 
 ## OpenAI Compatibility Endpoint
 
@@ -614,13 +684,14 @@ curl -X POST http://localhost:11434/v1/chat/completions \
 - **Protocol**: MCP 1.0
 - **Concurrency**: Max 10 parallel MCP servers
 - **Platform**: Linux/macOS (Windows untested)
-- **WebSocket timeout**: 60 seconds per tool call (configurable per-server planned)
+- **HTTP timeout**: 60 seconds per tool call (configurable per-server planned)
 
 ## Troubleshooting
 
 **"Tool not found"**
 - Verify MCP server initialized correctly
-- Check tool name includes namespace prefix
+- Check tool name includes namespace prefix (e.g., `filesystem:read_file`)
+- For remote servers, ensure URL is reachable
 
 **"MCP server failed to initialize"**
 - Check command path exists
@@ -635,6 +706,11 @@ curl -X POST http://localhost:11434/v1/chat/completions \
 - Path outside allowed directories
 - Security policy violation
 
+**"Connection refused" (HTTP transport)**
+- Verify remote server is running
+- Check URL includes correct port and path
+- Ensure firewall/network allows connection
+
 **Debug mode:**
 ```bash
 OLLAMA_DEBUG=INFO ollama serve
@@ -644,3 +720,4 @@ OLLAMA_DEBUG=INFO ollama serve
 
 - [MCP Specification](https://modelcontextprotocol.io/docs)
 - [Official MCP Servers](https://github.com/modelcontextprotocol/servers)
+- [A2A Bridge (Multi-Agent)](https://github.com/Code4me2/agentic_flow)

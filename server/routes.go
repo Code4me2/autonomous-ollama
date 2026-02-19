@@ -2113,6 +2113,7 @@ func (s *Server) executeCompletionWithTools(
 			if err != nil {
 				result.Error = err
 				done <- err
+				cancel() // Stop the completion to prevent Done callback deadlock
 				return
 			}
 
@@ -2239,6 +2240,12 @@ func (s *Server) executeCompletionWithTools(
 			done <- nil
 		}
 	})
+
+	// If the parser triggered a cancel (e.g. unknown tool name), report
+	// its error instead of the resulting context.Canceled from r.Completion.
+	if result.Error != nil {
+		return nil, result.Error
+	}
 
 	if err != nil {
 		return nil, err
@@ -2487,9 +2494,14 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		}
 
 		if mcpManager != nil {
-			// JIT: Start with only mcp_discover tool - model discovers others as needed
-			req.Tools = append(req.Tools, MCPDiscoverTool)
-			slog.Debug("MCP: Starting with mcp_discover tool only")
+			// If the session already discovered tools (from a prior request),
+			// include them so the parser recognises tool calls the model may
+			// generate based on conversation history.  For fresh sessions this
+			// returns just mcp_discover.
+			req.Tools = append(req.Tools, mcpManager.GetActiveTools()...)
+			slog.Info("MCP: Initial tools from session",
+				"count", len(req.Tools),
+				"discovered", mcpManager.GetDiscoveredToolCount())
 
 			// Inject context explaining mcp_discover and working directory
 			codeAPI := NewMCPCodeAPI(mcpManager)
@@ -2508,14 +2520,9 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			}
 		}
 
-		// Cleanup: Close MCP manager when request completes
-		defer func() {
-			if mcpManager != nil {
-				if err := mcpManager.Close(); err != nil {
-					slog.Warn("Error closing MCP manager", "error", err)
-				}
-			}
-		}()
+		// Note: MCP manager is NOT closed here - it's managed by the session manager
+		// which handles cleanup via TTL expiration. This allows session reuse across
+		// multiple requests with the same session_id.
 	}
 
 	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options, req.KeepAlive)
@@ -2827,8 +2834,25 @@ func (s *Server) ChatHandler(c *gin.Context) {
 						},
 					}
 
-					// Add discovery to message history so model knows tools are now available
-					// Build a tool result message with the discovery summary
+					// Collect the mcp_discover tool calls from the completion
+					var discoveryToolCalls []api.ToolCall
+					for _, toolCall := range completionResult.ToolCalls {
+						if IsMCPDiscoverCall(toolCall) {
+							discoveryToolCalls = append(discoveryToolCalls, toolCall)
+						}
+					}
+
+					// Add assistant message with discovery tool calls BEFORE tool results
+					// This ensures the conversation follows: user -> assistant(tool_call) -> tool(result)
+					if len(discoveryToolCalls) > 0 {
+						currentMsgs = append(currentMsgs, api.Message{
+							Role:      "assistant",
+							Content:   completionResult.Content,
+							ToolCalls: discoveryToolCalls,
+						})
+					}
+
+					// Add discovery tool result messages
 					for _, dr := range discoveryResults {
 						currentMsgs = append(currentMsgs, api.Message{
 							Role:    "tool",

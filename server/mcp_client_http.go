@@ -462,6 +462,15 @@ func (c *MCPHTTPClient) notify(method string, params interface{}) error {
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json, text/event-stream")
+
+	// Add session ID if we have one
+	c.mu.RLock()
+	if c.sessionID != "" {
+		httpReq.Header.Set("mcp-session-id", c.sessionID)
+	}
+	c.mu.RUnlock()
+
 	for k, v := range c.headers {
 		httpReq.Header.Set(k, v)
 	}

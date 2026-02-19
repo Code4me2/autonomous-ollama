@@ -51,24 +51,18 @@ func (m *MCPCodeAPI) GenerateJITContext(configs []api.MCPServerConfig) string {
 
 	context.WriteString(`You have access to external tools via MCP (Model Context Protocol).
 
-IMPORTANT: You start with only one tool: mcp_discover. To access other tools (file operations, etc.), you MUST first call mcp_discover to find and enable them.
+IMPORTANT: You start with only one tool: mcp_discover. To access other tools, you MUST first call mcp_discover to find and enable them.
 
 TOOL CALL FORMAT (you MUST use this exact format):
 [TOOL_CALLS]tool_name[ARGS]{"argument": "value"}
 
 Example workflow:
-1. User asks to list and read files
-2. First discover directory tools:
-   [TOOL_CALLS]mcp_discover[ARGS]{"pattern": "*directory*"}
-3. Then discover file tools:
-   [TOOL_CALLS]mcp_discover[ARGS]{"pattern": "*file*"}
-4. Use discovered tools:
-   [TOOL_CALLS]list_directory[ARGS]{"path": "."}
-   [TOOL_CALLS]read_file[ARGS]{"path": "example.txt"}
+1. Discover all available tools:
+   [TOOL_CALLS]mcp_discover[ARGS]{"pattern": "*"}
+2. Use the discovered tools to complete the task:
+   [TOOL_CALLS]get_schedule[ARGS]{"window": "today"}
 
-MULTI-STEP TASKS: If a task involves multiple types of operations (e.g., "list files and read them"), call mcp_discover multiple times with different patterns to find all needed tools BEFORE attempting the operations.
-
-Common patterns: "*file*", "*directory*", "*list*", "*search*", "*git*", "*" (all tools)
+ALWAYS start with pattern "*" to discover all tools. Only use a narrower pattern like "*file*" if you have too many tools and need to filter.
 `)
 
 	// Add filesystem working directory if applicable

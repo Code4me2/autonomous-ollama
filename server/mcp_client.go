@@ -36,6 +36,7 @@ type MCPClient struct {
 	mu          sync.RWMutex
 	initialized bool
 	tools       []api.Tool
+	serverInfo  mcpServerInfo
 	requestID   int64
 	responses   map[int64]chan *jsonRPCResponse
 
@@ -330,6 +331,7 @@ func (c *MCPClient) Initialize() error {
 
 	c.mu.Lock()
 	c.initialized = true
+	c.serverInfo = resp.ServerInfo
 	c.mu.Unlock()
 
 	slog.Info("MCP client initialized", "name", c.name, "server", resp.ServerInfo.Name)
@@ -489,6 +491,19 @@ func (c *MCPClient) GetTools() []api.Tool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.tools
+}
+
+// GetServerDescription returns a description derived from the MCP initialize handshake
+func (c *MCPClient) GetServerDescription() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.serverInfo.Name != "" {
+		if c.serverInfo.Version != "" {
+			return c.serverInfo.Name + " v" + c.serverInfo.Version
+		}
+		return c.serverInfo.Name
+	}
+	return ""
 }
 
 // Close shuts down the MCP client and terminates the server process

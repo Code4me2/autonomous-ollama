@@ -685,6 +685,9 @@ type MCPServerConfig struct {
 	// Name is a unique identifier for the MCP server
 	Name string `json:"name"`
 
+	// Description is a human-readable description of the server's purpose
+	Description string `json:"description,omitempty"`
+
 	// Transport specifies the communication transport (default: "stdio")
 	// Supported values: "stdio", "http", "streamable-http"
 	Transport MCPTransport `json:"transport,omitempty"`
@@ -785,6 +788,7 @@ type Options struct {
 	RepeatPenalty    float32  `json:"repeat_penalty,omitempty"`
 	PresencePenalty  float32  `json:"presence_penalty,omitempty"`
 	FrequencyPenalty float32  `json:"frequency_penalty,omitempty"`
+	ReasoningBudget  int      `json:"reasoning_budget,omitempty"`
 	Stop             []string `json:"stop,omitempty"`
 }
 
@@ -1243,7 +1247,8 @@ func (opts *Options) FromMap(m map[string]any) error {
 func DefaultOptions() Options {
 	return Options{
 		// options set on request to runner
-		NumPredict: -1,
+		NumPredict:      -1,
+		ReasoningBudget: -1,
 
 		// set a minimal num_keep to avoid issues on context shifts
 		NumKeep:          4,

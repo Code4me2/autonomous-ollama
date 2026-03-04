@@ -242,10 +242,11 @@ func (d *MCPDefinitions) buildConfigForAutoEnable(def MCPServerDefinition, ctx A
 	resolvedCommand := DefaultCommandResolver.ResolveForEnvironment(def.Command)
 
 	config := api.MCPServerConfig{
-		Name:    def.Name,
-		Command: resolvedCommand,
-		Args:    append([]string{}, def.Args...), // Copy args
-		Env:     make(map[string]string),
+		Name:        def.Name,
+		Description: def.Description,
+		Command:     resolvedCommand,
+		Args:        append([]string{}, def.Args...), // Copy args
+		Env:         make(map[string]string),
 	}
 
 	// Copy environment variables

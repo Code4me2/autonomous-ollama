@@ -236,6 +236,24 @@ func (c *MCPHTTPClient) GetTools() []api.Tool {
 	return c.tools
 }
 
+// GetServerDescription returns a description derived from the MCP initialize handshake
+func (c *MCPHTTPClient) GetServerDescription() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.serverInfo == nil {
+		return ""
+	}
+	name, _ := c.serverInfo["name"].(string)
+	version, _ := c.serverInfo["version"].(string)
+	if name != "" {
+		if version != "" {
+			return name + " v" + version
+		}
+		return name
+	}
+	return ""
+}
+
 // Close shuts down the HTTP client
 func (c *MCPHTTPClient) Close() error {
 	slog.Info("Shutting down MCP HTTP client", "name", c.name)

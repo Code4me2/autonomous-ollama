@@ -20,6 +20,9 @@ type MCPClientInterface interface {
 	// GetTools returns the cached list of tools
 	GetTools() []api.Tool
 
+	// GetServerDescription returns a description from the MCP server's initialize handshake
+	GetServerDescription() string
+
 	// Close shuts down the connection
 	Close() error
 }

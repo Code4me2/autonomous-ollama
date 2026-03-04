@@ -2776,13 +2776,13 @@ func (s *Server) ChatHandler(c *gin.Context) {
 					"valid_tools", validToolCalls,
 					"round", round)
 
-				// Check for mcp_discover calls FIRST
+				// Check for mcp_discover / mcp_list_tools calls FIRST
 				var discoveryResults []api.ToolResult
 				var regularToolCalls []api.ToolCall
 
 				for _, toolCall := range completionResult.ToolCalls {
 					if IsMCPDiscoverCall(toolCall) {
-						// Handle discovery
+						// Tier 1: Server catalog (no tool injection)
 						pattern, _ := toolCall.Function.Arguments.Get("pattern")
 						patternStr, _ := pattern.(string)
 
@@ -2790,7 +2790,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 							patternStr = "*" // Default to all if no pattern
 						}
 
-						newTools, summary, err := mcpManager.HandleDiscovery(patternStr)
+						summary, err := mcpManager.HandleDiscovery(patternStr)
 						if err != nil {
 							discoveryResults = append(discoveryResults, api.ToolResult{
 								ToolName:  "mcp_discover",
@@ -2801,27 +2801,66 @@ func (s *Server) ChatHandler(c *gin.Context) {
 							continue
 						}
 
-						// Inject discovered tools for next round
-						if len(newTools) > 0 {
-							processedTools = append(processedTools, newTools...)
-							slog.Info("JIT: Injected discovered tools",
-								"pattern", patternStr,
-								"count", len(newTools),
-								"total_active", len(processedTools))
-						}
-
-						// Add discovery result for model context
 						discoveryResults = append(discoveryResults, api.ToolResult{
 							ToolName:  "mcp_discover",
 							Arguments: toolCall.Function.Arguments,
 							Content:   summary,
 						})
+
+					} else if IsMCPListToolsCall(toolCall) {
+						// Tier 2: Load tools from specific servers
+						serversRaw, _ := toolCall.Function.Arguments.Get("servers")
+						var serverNames []string
+						if serversSlice, ok := serversRaw.([]interface{}); ok {
+							for _, s := range serversSlice {
+								if name, ok := s.(string); ok {
+									serverNames = append(serverNames, name)
+								}
+							}
+						}
+
+						if len(serverNames) == 0 {
+							discoveryResults = append(discoveryResults, api.ToolResult{
+								ToolName:  "mcp_list_tools",
+								Arguments: toolCall.Function.Arguments,
+								Content:   "Error: 'servers' must be a non-empty array of server names. Use mcp_discover first to see available servers.",
+								Error:     "missing or empty servers parameter",
+							})
+							continue
+						}
+
+						newTools, summary, err := mcpManager.HandleListTools(serverNames)
+						if err != nil {
+							discoveryResults = append(discoveryResults, api.ToolResult{
+								ToolName:  "mcp_list_tools",
+								Arguments: toolCall.Function.Arguments,
+								Content:   fmt.Sprintf("Error loading tools: %v", err),
+								Error:     err.Error(),
+							})
+							continue
+						}
+
+						// Inject discovered tools for next round
+						if len(newTools) > 0 {
+							processedTools = append(processedTools, newTools...)
+							slog.Info("JIT: Injected tools from mcp_list_tools",
+								"servers", serverNames,
+								"count", len(newTools),
+								"total_active", len(processedTools))
+						}
+
+						discoveryResults = append(discoveryResults, api.ToolResult{
+							ToolName:  "mcp_list_tools",
+							Arguments: toolCall.Function.Arguments,
+							Content:   summary,
+						})
+
 					} else {
 						regularToolCalls = append(regularToolCalls, toolCall)
 					}
 				}
 
-				// If we had discovery calls, add to context so model knows tools are available
+				// If we had discovery/list_tools calls, add to context
 				if len(discoveryResults) > 0 {
 					// Send discovery results to client for visibility
 					ch <- api.ChatResponse{
@@ -2834,10 +2873,10 @@ func (s *Server) ChatHandler(c *gin.Context) {
 						},
 					}
 
-					// Collect the mcp_discover tool calls from the completion
+					// Collect the mcp_discover and mcp_list_tools tool calls from the completion
 					var discoveryToolCalls []api.ToolCall
 					for _, toolCall := range completionResult.ToolCalls {
-						if IsMCPDiscoverCall(toolCall) {
+						if IsMCPDiscoverCall(toolCall) || IsMCPListToolsCall(toolCall) {
 							discoveryToolCalls = append(discoveryToolCalls, toolCall)
 						}
 					}
@@ -2860,14 +2899,14 @@ func (s *Server) ChatHandler(c *gin.Context) {
 						})
 					}
 
-					slog.Info("JIT: Discovery complete, tools now in context",
-						"discovered", len(discoveryResults),
+					slog.Info("JIT: Discovery/list_tools complete",
+						"results", len(discoveryResults),
 						"messages", len(currentMsgs))
 				}
 
-				// If ONLY discovery happened (no regular tools), continue to next round
+				// If ONLY discovery/list_tools happened (no regular tools), continue to next round
 				if len(regularToolCalls) == 0 && len(discoveryResults) > 0 {
-					slog.Info("JIT: Only discovery calls, continuing to next round",
+					slog.Info("JIT: Only discovery/list_tools calls, continuing to next round",
 						"round", round,
 						"regular_tools", len(regularToolCalls),
 						"discovery_results", len(discoveryResults),

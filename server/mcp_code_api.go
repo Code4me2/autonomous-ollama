@@ -45,24 +45,26 @@ All filesystem tool paths must be within this directory.
 	return result
 }
 
-// GenerateJITContext returns context explaining the mcp_discover tool for JIT mode.
+// GenerateJITContext returns context explaining the two-step discovery workflow for JIT mode.
 func (m *MCPCodeAPI) GenerateJITContext(configs []api.MCPServerConfig) string {
 	var context strings.Builder
 
 	context.WriteString(`You have access to external tools via MCP (Model Context Protocol).
 
-IMPORTANT: You start with only one tool: mcp_discover. To access other tools, you MUST first call mcp_discover to find and enable them.
+IMPORTANT: Tools are discovered in two steps:
 
-TOOL CALL FORMAT (you MUST use this exact format):
-[TOOL_CALLS]tool_name[ARGS]{"argument": "value"}
+STEP 1: Discover available servers:
+  [TOOL_CALLS]mcp_discover[ARGS]{"pattern": "*"}
+  → Returns a catalog of servers with names, descriptions, and tool counts.
 
-Example workflow:
-1. Discover all available tools:
-   [TOOL_CALLS]mcp_discover[ARGS]{"pattern": "*"}
-2. Use the discovered tools to complete the task:
-   [TOOL_CALLS]get_schedule[ARGS]{"window": "today"}
+STEP 2: Load tools from the servers you need:
+  [TOOL_CALLS]mcp_list_tools[ARGS]{"servers": ["ServerName"]}
+  → Returns tool definitions that become available for use.
 
-ALWAYS start with pattern "*" to discover all tools. Only use a narrower pattern like "*file*" if you have too many tools and need to filter.
+STEP 3: Use the loaded tools:
+  [TOOL_CALLS]ServerName:tool_name[ARGS]{"argument": "value"}
+
+ALWAYS start with mcp_discover to see what servers are available, then use mcp_list_tools to load tools from the servers you need.
 `)
 
 	// Add filesystem working directory if applicable

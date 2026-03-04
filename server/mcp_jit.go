@@ -7,25 +7,23 @@ import (
 	"github.com/ollama/ollama/api"
 )
 
-// MCPDiscoverTool is the built-in meta-tool for JIT discovery
+// MCPDiscoverTool is the built-in meta-tool for discovering available MCP servers
 var MCPDiscoverTool = api.Tool{
 	Type: "function",
 	Function: api.ToolFunction{
 		Name: "mcp_discover",
-		Description: `Search for available tools by capability pattern.
+		Description: `Discover available MCP servers and their capabilities.
 
-WHEN TO USE: Call this when you need a tool you don't currently have.
-After calling, matching tools become available for your next action.
+WHEN TO USE: Call this FIRST to see what servers are available.
+Returns a catalog of servers with name, description, and tool count.
+
+After discovering servers, use mcp_list_tools to load tools from specific servers.
 
 PATTERNS:
-- "*file*" or "*read*" - File operations (read, write, list, search)
-- "*git*" - Git operations (status, commit, diff, log)
-- "*sql*" or "*postgres*" or "*database*" - Database operations
-- "*search*" - Search capabilities
-- "*http*" or "*fetch*" - HTTP/API operations
-- "*" - List all available tools (use sparingly)
+- "*" - List all available servers
+- "*calendar*" - Servers matching pattern
 
-RETURNS: Description of discovered tools. Use them in your next response.`,
+RETURNS: Server catalog. Then call mcp_list_tools with the server names you need.`,
 		Parameters: api.ToolFunctionParameters{
 			Type:     "object",
 			Required: []string{"pattern"},
@@ -33,7 +31,34 @@ RETURNS: Description of discovered tools. Use them in your next response.`,
 				m := api.NewToolPropertiesMap()
 				m.Set("pattern", api.ToolProperty{
 					Type:        []string{"string"},
-					Description: "Glob pattern to match tool names (e.g., '*file*', '*git*')",
+					Description: "Glob pattern to match server names (e.g., '*', '*calendar*')",
+				})
+				return m
+			}(),
+		},
+	},
+}
+
+// MCPListToolsTool is the built-in meta-tool for loading tools from specific servers
+var MCPListToolsTool = api.Tool{
+	Type: "function",
+	Function: api.ToolFunction{
+		Name: "mcp_list_tools",
+		Description: `Load tools from specific MCP servers.
+
+WHEN TO USE: After calling mcp_discover, call this with the server names you need.
+The tools become available for your next action.
+
+RETURNS: Tool definitions from the requested servers.`,
+		Parameters: api.ToolFunctionParameters{
+			Type:     "object",
+			Required: []string{"servers"},
+			Properties: func() *api.ToolPropertiesMap {
+				m := api.NewToolPropertiesMap()
+				m.Set("servers", api.ToolProperty{
+					Type:        []string{"array"},
+					Description: "List of server names to load tools from",
+					Items:       map[string]interface{}{"type": "string"},
 				})
 				return m
 			}(),
@@ -44,6 +69,11 @@ RETURNS: Description of discovered tools. Use them in your next response.`,
 // IsMCPDiscoverCall checks if a tool call is for mcp_discover
 func IsMCPDiscoverCall(toolCall api.ToolCall) bool {
 	return toolCall.Function.Name == "mcp_discover"
+}
+
+// IsMCPListToolsCall checks if a tool call is for mcp_list_tools
+func IsMCPListToolsCall(toolCall api.ToolCall) bool {
+	return toolCall.Function.Name == "mcp_list_tools"
 }
 
 // MatchToolPattern checks if a tool name matches a glob pattern

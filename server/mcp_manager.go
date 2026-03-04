@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 
@@ -21,10 +22,20 @@ type MCPManager struct {
 	// Lazy connection support (always enabled - JIT is the only mode)
 	pendingConfigs map[string]api.MCPServerConfig
 
+	// Server metadata (persists after connection)
+	configDescriptions map[string]string // server name -> description from config
+
 	// JIT discovery state
 	discoveredTools      map[string]api.Tool   // tool name -> tool schema
 	allToolsCache        map[string][]api.Tool // server name -> tools (for pattern matching)
 	maxToolsPerDiscovery int                   // limits injection per discovery call
+}
+
+// ServerCatalogEntry represents a server in the discovery catalog
+type ServerCatalogEntry struct {
+	Name        string
+	Description string
+	ToolCount   int
 }
 
 // MCPServerConfig is imported from api package
@@ -52,6 +63,7 @@ func NewMCPManager(maxClients int, maxToolsPerDiscovery int) *MCPManager {
 		clients:              make(map[string]MCPClientInterface),
 		toolRouting:          make(map[string]string),
 		pendingConfigs:       make(map[string]api.MCPServerConfig),
+		configDescriptions:   make(map[string]string),
 		maxClients:           maxClients,
 		discoveredTools:      make(map[string]api.Tool),
 		allToolsCache:        make(map[string][]api.Tool),
@@ -74,6 +86,9 @@ func (m *MCPManager) AddServerLazy(config api.MCPServerConfig) error {
 	}
 
 	m.pendingConfigs[config.Name] = config
+	if config.Description != "" {
+		m.configDescriptions[config.Name] = config.Description
+	}
 	slog.Debug("MCP server registered for lazy connection", "name", config.Name)
 	return nil
 }
@@ -198,6 +213,9 @@ func (m *MCPManager) AddServer(config api.MCPServerConfig) error {
 	}
 
 	m.clients[config.Name] = client
+	if config.Description != "" {
+		m.configDescriptions[config.Name] = config.Description
+	}
 
 	slog.Info("MCP server added", "name", config.Name, "tools", len(tools))
 	return nil
@@ -550,15 +568,15 @@ func (m *MCPManager) Shutdown() error {
 }
 
 // =============================================================================
-// JIT Discovery Methods (unified state management)
+// JIT Discovery Methods (two-tier: server catalog + tool loading)
 // =============================================================================
 
-// GetActiveTools returns mcp_discover + all discovered tools for JIT mode
+// GetActiveTools returns mcp_discover + mcp_list_tools + all discovered tools for JIT mode
 func (m *MCPManager) GetActiveTools() []api.Tool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	tools := []api.Tool{MCPDiscoverTool}
+	tools := []api.Tool{MCPDiscoverTool, MCPListToolsTool}
 	for _, tool := range m.discoveredTools {
 		tools = append(tools, tool)
 	}
@@ -584,136 +602,245 @@ func (m *MCPManager) IsToolDiscovered(toolName string) bool {
 	return exists
 }
 
-// SearchTools searches all pending/connected servers for matching tools
-func (m *MCPManager) SearchTools(pattern string) ([]api.Tool, []string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	var matchedTools []api.Tool
-	var serversTried []string
-	seen := make(map[string]bool)
-
-	// Search each pending server
-	for serverName, config := range m.pendingConfigs {
-		serversTried = append(serversTried, serverName)
-
-		// Connect to server if not already connected
-		if _, connected := m.clients[serverName]; !connected {
-			// Need to unlock for AddServer (which takes its own lock)
-			m.mu.Unlock()
-			if err := m.AddServer(config); err != nil {
-				slog.Warn("JIT: Failed to connect to MCP server for discovery",
-					"server", serverName, "error", err)
-				m.mu.Lock()
-				continue
-			}
-			m.mu.Lock()
-		}
-
-		// Get tools from cache or fetch
-		var tools []api.Tool
-		if cached, exists := m.allToolsCache[serverName]; exists {
-			tools = cached
-		} else {
-			m.mu.Unlock()
-			var err error
-			tools, err = m.GetToolsFromServer(serverName)
-			m.mu.Lock()
-			if err != nil {
-				slog.Warn("JIT: Failed to list tools from server",
-					"server", serverName, "error", err)
-				continue
-			}
-			m.allToolsCache[serverName] = tools
-		}
-
-		// Match against pattern
-		for _, tool := range tools {
-			if seen[tool.Function.Name] {
-				continue
-			}
-			if MatchToolPattern(pattern, tool.Function.Name) {
-				matchedTools = append(matchedTools, tool)
-				seen[tool.Function.Name] = true
-				m.toolRouting[tool.Function.Name] = serverName
-
-				// Respect limit
-				if len(matchedTools) >= m.maxToolsPerDiscovery {
-					return matchedTools, serversTried, nil
-				}
-			}
+// resolveServerDescription returns the best description for a server using the fallback chain:
+// config Description → client GetServerDescription() → "(no description)"
+func (m *MCPManager) resolveServerDescription(serverName string) string {
+	// 1. Config description (highest priority)
+	if desc, exists := m.configDescriptions[serverName]; exists && desc != "" {
+		return desc
+	}
+	// 2. Client handshake description
+	if client, exists := m.clients[serverName]; exists {
+		if desc := client.GetServerDescription(); desc != "" {
+			return desc
 		}
 	}
-
-	return matchedTools, serversTried, nil
+	// 3. Fallback
+	return "(no description)"
 }
 
-// HandleDiscovery processes an mcp_discover call and returns:
-// - tools: schemas to inject for next round
-// - summary: human-readable result for model context
-// - error: any error encountered
-func (m *MCPManager) HandleDiscovery(pattern string) ([]api.Tool, string, error) {
-	tools, servers, err := m.SearchTools(pattern)
-	if err != nil {
-		return nil, "", err
-	}
-
-	if len(tools) == 0 {
-		return nil, fmt.Sprintf(
-			"No tools found matching pattern '%s'. Searched servers: %s. "+
-				"Try a different pattern like '*file*', '*git*', or '*' to see all.",
-			pattern, strings.Join(servers, ", ")), nil
-	}
-
-	// Filter out already discovered tools
-	var newTools []api.Tool
+// ensureConnectedUnlocked connects to a server, assuming the caller does NOT hold m.mu.
+// Returns the tool count for the server.
+func (m *MCPManager) ensureConnectedUnlocked(serverName string) (int, error) {
+	// Check if already connected
 	m.mu.RLock()
-	for _, tool := range tools {
-		if _, exists := m.discoveredTools[tool.Function.Name]; !exists {
-			newTools = append(newTools, tool)
+	if client, exists := m.clients[serverName]; exists {
+		tools := client.GetTools()
+		m.mu.RUnlock()
+		if len(tools) > 0 {
+			return len(tools), nil
 		}
+		// Connected but no cached tools — fetch them
+		fetchedTools, err := client.ListTools()
+		if err != nil {
+			return 0, err
+		}
+		return len(fetchedTools), nil
 	}
 	m.mu.RUnlock()
 
-	// Build summary for model
-	var summaryParts []string
-	for _, tool := range tools {
-		// Truncate description for summary
-		desc := tool.Function.Description
-		if len(desc) > 80 {
-			desc = desc[:77] + "..."
+	// Try to connect
+	if err := m.EnsureConnected(serverName); err != nil {
+		return 0, err
+	}
+
+	// Get tool count
+	m.mu.RLock()
+	client, exists := m.clients[serverName]
+	m.mu.RUnlock()
+	if !exists {
+		return 0, fmt.Errorf("server '%s' not found after connection", serverName)
+	}
+
+	tools, err := client.ListTools()
+	if err != nil {
+		return 0, err
+	}
+
+	// Cache tools
+	m.mu.Lock()
+	m.allToolsCache[serverName] = tools
+	m.mu.Unlock()
+
+	return len(tools), nil
+}
+
+// BuildServerCatalog returns a catalog of servers matching the pattern.
+// Each entry includes server name, description, and tool count.
+func (m *MCPManager) BuildServerCatalog(pattern string) []ServerCatalogEntry {
+	m.mu.RLock()
+	// Collect all server names (pending + connected)
+	serverNames := make(map[string]bool)
+	for name := range m.pendingConfigs {
+		serverNames[name] = true
+	}
+	for name := range m.clients {
+		serverNames[name] = true
+	}
+	m.mu.RUnlock()
+
+	// Sort server names for deterministic catalog order
+	sortedNames := make([]string, 0, len(serverNames))
+	for name := range serverNames {
+		sortedNames = append(sortedNames, name)
+	}
+	sort.Strings(sortedNames)
+
+	var catalog []ServerCatalogEntry
+
+	for _, name := range sortedNames {
+		// Match pattern against server name
+		if !MatchToolPattern(pattern, name) {
+			continue
 		}
+
+		// Lazily connect to get tool count
+		toolCount, err := m.ensureConnectedUnlocked(name)
+		if err != nil {
+			slog.Warn("JIT: Failed to connect to server for catalog",
+				"server", name, "error", err)
+			// Still include it with 0 tools so model knows it exists
+			m.mu.RLock()
+			desc := m.resolveServerDescription(name)
+			m.mu.RUnlock()
+			catalog = append(catalog, ServerCatalogEntry{
+				Name:        name,
+				Description: desc + " (connection failed)",
+				ToolCount:   0,
+			})
+			continue
+		}
+
+		m.mu.RLock()
+		desc := m.resolveServerDescription(name)
+		m.mu.RUnlock()
+
+		catalog = append(catalog, ServerCatalogEntry{
+			Name:        name,
+			Description: desc,
+			ToolCount:   toolCount,
+		})
+	}
+
+	return catalog
+}
+
+// HandleDiscovery processes an mcp_discover call and returns a server catalog summary.
+// This is tier 1 of the two-tier discovery: it does NOT return tool schemas.
+func (m *MCPManager) HandleDiscovery(pattern string) (string, error) {
+	catalog := m.BuildServerCatalog(pattern)
+
+	if len(catalog) == 0 {
+		return fmt.Sprintf(
+			"No servers found matching pattern '%s'. Try '*' to list all servers.",
+			pattern), nil
+	}
+
+	// Build summary
+	var summaryParts []string
+	for _, entry := range catalog {
 		summaryParts = append(summaryParts,
-			fmt.Sprintf("- %s: %s", tool.Function.Name, desc))
+			fmt.Sprintf("- %s: %s (%d tools)", entry.Name, entry.Description, entry.ToolCount))
 	}
 
-	alreadyKnown := len(tools) - len(newTools)
 	summary := fmt.Sprintf(
-		"Found %d tools matching '%s':\n%s",
-		len(tools), pattern, strings.Join(summaryParts, "\n"))
+		"Available servers (%d):\n%s\n\nCall mcp_list_tools with the server names you need to load their tools.",
+		len(catalog), strings.Join(summaryParts, "\n"))
 
-	if alreadyKnown > 0 {
-		summary += fmt.Sprintf("\n\n(%d tools were already available)", alreadyKnown)
+	slog.Info("JIT: Server catalog built",
+		"pattern", pattern,
+		"servers", len(catalog))
+
+	return summary, nil
+}
+
+// HandleListTools processes an mcp_list_tools call and returns tool schemas from requested servers.
+// This is tier 2 of the two-tier discovery: it returns actual tool definitions.
+func (m *MCPManager) HandleListTools(serverNames []string) ([]api.Tool, string, error) {
+	var allNewTools []api.Tool
+	var summaryParts []string
+
+	for _, serverName := range serverNames {
+		// Ensure connected
+		if err := m.EnsureConnected(serverName); err != nil {
+			summaryParts = append(summaryParts,
+				fmt.Sprintf("- %s: connection failed: %v", serverName, err))
+			continue
+		}
+
+		// Get tools from this server
+		tools, err := m.GetToolsFromServer(serverName)
+		if err != nil {
+			summaryParts = append(summaryParts,
+				fmt.Sprintf("- %s: failed to list tools: %v", serverName, err))
+			continue
+		}
+
+		// Cache tools
+		m.mu.Lock()
+		m.allToolsCache[serverName] = tools
+		m.mu.Unlock()
+
+		// Filter out already-discovered tools, apply per-server limit
+		var newTools []api.Tool
+		var toolNames []string
+		for _, tool := range tools {
+			toolNames = append(toolNames, tool.Function.Name)
+
+			m.mu.RLock()
+			_, alreadyDiscovered := m.discoveredTools[tool.Function.Name]
+			m.mu.RUnlock()
+
+			if !alreadyDiscovered {
+				newTools = append(newTools, tool)
+				if len(newTools) >= m.maxToolsPerDiscovery {
+					break
+				}
+			}
+		}
+
+		// Add new tools to discovered set
+		m.mu.Lock()
+		for _, tool := range newTools {
+			m.discoveredTools[tool.Function.Name] = tool
+			m.toolRouting[tool.Function.Name] = serverName
+		}
+		m.mu.Unlock()
+
+		allNewTools = append(allNewTools, newTools...)
+
+		// Build per-server summary
+		var toolDescParts []string
+		for _, tool := range newTools {
+			desc := tool.Function.Description
+			if len(desc) > 80 {
+				desc = desc[:77] + "..."
+			}
+			toolDescParts = append(toolDescParts,
+				fmt.Sprintf("  - %s: %s", tool.Function.Name, desc))
+		}
+
+		alreadyKnown := len(tools) - len(newTools)
+		serverSummary := fmt.Sprintf("- %s (%d new tools):\n%s",
+			serverName, len(newTools), strings.Join(toolDescParts, "\n"))
+		if alreadyKnown > 0 {
+			serverSummary += fmt.Sprintf("\n  (%d tools already loaded)", alreadyKnown)
+		}
+		summaryParts = append(summaryParts, serverSummary)
 	}
 
-	if len(newTools) > 0 {
+	summary := fmt.Sprintf("Loaded tools from %d server(s):\n%s",
+		len(serverNames), strings.Join(summaryParts, "\n"))
+
+	if len(allNewTools) > 0 {
 		summary += "\n\nThese tools are now available. Call them directly in your next response."
 	}
 
-	// Add new tools to discovered set
-	m.mu.Lock()
-	for _, tool := range newTools {
-		m.discoveredTools[tool.Function.Name] = tool
-	}
-	m.mu.Unlock()
+	slog.Info("JIT: Tools loaded from servers",
+		"servers", len(serverNames),
+		"new_tools", len(allNewTools))
 
-	slog.Info("JIT: Discovery completed",
-		"pattern", pattern,
-		"found", len(tools),
-		"new", len(newTools),
-		"already_known", alreadyKnown)
-
-	return newTools, summary, nil
+	return allNewTools, summary, nil
 }
 
 // GetDiscoveredToolCount returns the number of discovered tools

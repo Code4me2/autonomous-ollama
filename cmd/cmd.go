@@ -42,6 +42,7 @@ import (
 	"github.com/ollama/ollama/cmd/tui"
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
+	"github.com/ollama/ollama/internal/modelref"
 	"github.com/ollama/ollama/parser"
 	"github.com/ollama/ollama/progress"
 	"github.com/ollama/ollama/readline"
@@ -58,9 +59,9 @@ import (
 
 func init() {
 	// Override default selectors to use Bubbletea TUI instead of raw terminal I/O.
-	config.DefaultSingleSelector = func(title string, items []config.ModelItem) (string, error) {
+	config.DefaultSingleSelector = func(title string, items []config.ModelItem, current string) (string, error) {
 		tuiItems := tui.ReorderItems(tui.ConvertItems(items))
-		result, err := tui.SelectSingle(title, tuiItems)
+		result, err := tui.SelectSingle(title, tuiItems, current)
 		if errors.Is(err, tui.ErrCancelled) {
 			return "", config.ErrCancelled
 		}
@@ -153,6 +154,12 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 	// Check for --experimental flag for safetensors model creation
 	experimental, _ := cmd.Flags().GetBool("experimental")
 	if experimental {
+		host := envconfig.Host()
+		h, _, _ := net.SplitHostPort(host.Host)
+		ip := net.ParseIP(h)
+		if ip == nil || (!ip.IsLoopback() && !ip.IsUnspecified()) {
+			return errors.New("remote safetensor model creation not yet supported")
+		}
 		// Get Modelfile content - either from -f flag or default to "FROM ."
 		var reader io.Reader
 		filename, err := getModelfileName(cmd)
@@ -190,6 +197,10 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 				mfConfig.System = cmd.Args
 			case "license":
 				mfConfig.License = cmd.Args
+			case "parser":
+				mfConfig.Parser = cmd.Args
+			case "renderer":
+				mfConfig.Renderer = cmd.Args
 			}
 		}
 
@@ -218,6 +229,12 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 		if filename == "" {
 			// No Modelfile found - check if current directory is an image gen model
 			if create.IsTensorModelDir(".") {
+				host := envconfig.Host()
+				h, _, _ := net.SplitHostPort(host.Host)
+				ip := net.ParseIP(h)
+				if ip == nil || (!ip.IsLoopback() && !ip.IsUnspecified()) {
+					return errors.New("remote safetensor model creation not yet supported")
+				}
 				quantize, _ := cmd.Flags().GetString("quantize")
 				return xcreateclient.CreateModel(xcreateclient.CreateOptions{
 					ModelName: modelName,
@@ -410,12 +427,14 @@ func loadOrUnloadModel(cmd *cobra.Command, opts *runOptions) error {
 		return err
 	}
 
+	requestedCloud := modelref.HasExplicitCloudSource(opts.Model)
+
 	if info, err := client.Show(cmd.Context(), &api.ShowRequest{Model: opts.Model}); err != nil {
 		return err
-	} else if info.RemoteHost != "" {
+	} else if info.RemoteHost != "" || requestedCloud {
 		// Cloud model, no need to load/unload
 
-		isCloud := strings.HasPrefix(info.RemoteHost, "https://ollama.com")
+		isCloud := requestedCloud || strings.HasPrefix(info.RemoteHost, "https://ollama.com")
 
 		// Check if user is signed in for ollama.com cloud models
 		if isCloud {
@@ -426,10 +445,14 @@ func loadOrUnloadModel(cmd *cobra.Command, opts *runOptions) error {
 
 		if opts.ShowConnect {
 			p.StopAndClear()
+			remoteModel := info.RemoteModel
+			if remoteModel == "" {
+				remoteModel = opts.Model
+			}
 			if isCloud {
-				fmt.Fprintf(os.Stderr, "Connecting to '%s' on 'ollama.com' ⚡\n", info.RemoteModel)
+				fmt.Fprintf(os.Stderr, "Connecting to '%s' on 'ollama.com' ⚡\n", remoteModel)
 			} else {
-				fmt.Fprintf(os.Stderr, "Connecting to '%s' on '%s'\n", info.RemoteModel, info.RemoteHost)
+				fmt.Fprintf(os.Stderr, "Connecting to '%s' on '%s'\n", remoteModel, info.RemoteHost)
 			}
 		}
 
@@ -499,6 +522,20 @@ func generateEmbedding(cmd *cobra.Command, modelName, input string, keepAlive *a
 	fmt.Println(string(output))
 
 	return nil
+}
+
+// TODO(parthsareen): consolidate with TUI signin flow
+func handleCloudAuthorizationError(err error) bool {
+	var authErr api.AuthorizationError
+	if errors.As(err, &authErr) && authErr.StatusCode == http.StatusUnauthorized {
+		fmt.Printf("You need to be signed in to Ollama to run Cloud models.\n\n")
+		if authErr.SigninURL != "" {
+			fmt.Printf(ConnectInstructions, authErr.SigninURL)
+		}
+		return true
+	}
+
+	return false
 }
 
 func RunHandler(cmd *cobra.Command, args []string) error {
@@ -632,12 +669,16 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	name := args[0]
+	requestedCloud := modelref.HasExplicitCloudSource(name)
 
 	info, err := func() (*api.ShowResponse, error) {
 		showReq := &api.ShowRequest{Name: name}
 		info, err := client.Show(cmd.Context(), showReq)
 		var se api.StatusError
 		if errors.As(err, &se) && se.StatusCode == http.StatusNotFound {
+			if requestedCloud {
+				return nil, err
+			}
 			if err := PullHandler(cmd, []string{name}); err != nil {
 				return nil, err
 			}
@@ -646,6 +687,9 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		return info, err
 	}()
 	if err != nil {
+		if handleCloudAuthorizationError(err) {
+			return nil
+		}
 		return err
 	}
 
@@ -740,7 +784,13 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 
 		return generateInteractive(cmd, opts)
 	}
-	return generate(cmd, opts)
+	if err := generate(cmd, opts); err != nil {
+		if handleCloudAuthorizationError(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func SigninHandler(cmd *cobra.Command, args []string) error {
@@ -2315,12 +2365,9 @@ func runInteractiveTUI(cmd *cobra.Command) {
 	}
 
 	// Selector adapters for tui
-	singleSelector := func(title string, items []config.ModelItem) (string, error) {
-		tuiItems := make([]tui.SelectItem, len(items))
-		for i, item := range items {
-			tuiItems[i] = tui.SelectItem{Name: item.Name, Description: item.Description, Recommended: item.Recommended}
-		}
-		result, err := tui.SelectSingle(title, tuiItems)
+	singleSelector := func(title string, items []config.ModelItem, current string) (string, error) {
+		tuiItems := tui.ReorderItems(tui.ConvertItems(items))
+		result, err := tui.SelectSingle(title, tuiItems, current)
 		if errors.Is(err, tui.ErrCancelled) {
 			return "", config.ErrCancelled
 		}
@@ -2328,10 +2375,7 @@ func runInteractiveTUI(cmd *cobra.Command) {
 	}
 
 	multiSelector := func(title string, items []config.ModelItem, preChecked []string) ([]string, error) {
-		tuiItems := make([]tui.SelectItem, len(items))
-		for i, item := range items {
-			tuiItems[i] = tui.SelectItem{Name: item.Name, Description: item.Description, Recommended: item.Recommended}
-		}
+		tuiItems := tui.ReorderItems(tui.ConvertItems(items))
 		result, err := tui.SelectMultiple(title, tuiItems, preChecked)
 		if errors.Is(err, tui.ErrCancelled) {
 			return nil, config.ErrCancelled
@@ -2376,6 +2420,10 @@ func runInteractiveTUI(cmd *cobra.Command) {
 		}
 
 		launchIntegration := func(name string) bool {
+			if err := config.EnsureInstalled(name); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				return true
+			}
 			// If not configured or model no longer exists, prompt for model selection
 			configuredModel := config.IntegrationModel(name)
 			if configuredModel == "" || !config.ModelExists(cmd.Context(), configuredModel) || config.IsCloudModelDisabled(cmd.Context(), configuredModel) {
@@ -2582,6 +2630,9 @@ func NewCLI() *cobra.Command {
 
 	// Image generation flags (width, height, steps, seed, etc.)
 	imagegen.RegisterFlags(runCmd)
+
+	runCmd.Flags().Bool("imagegen", false, "Use the imagegen runner for LLM inference")
+	runCmd.Flags().MarkHidden("imagegen")
 
 	stopCmd := &cobra.Command{
 		Use:     "stop MODEL",

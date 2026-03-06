@@ -76,6 +76,17 @@ const (
 	cloudErrRemoteModelDetailsUnavailable = "remote model details are unavailable"
 )
 
+func writeModelRefParseError(c *gin.Context, err error, fallbackStatus int, fallbackMessage string) {
+	switch {
+	case errors.Is(err, errConflictingModelSource):
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	case errors.Is(err, model.ErrUnqualifiedName):
+		c.JSON(http.StatusBadRequest, gin.H{"error": errtypes.InvalidModelNameErrMsg})
+	default:
+		c.JSON(fallbackStatus, gin.H{"error": fallbackMessage})
+	}
+}
+
 func shouldUseHarmony(model *Model) bool {
 	if slices.Contains([]string{"gptoss", "gpt-oss"}, model.Config.ModelFamily) {
 		// heuristic to check whether the template expects to be parsed via harmony:
@@ -162,6 +173,9 @@ func (s *Server) scheduleRunner(ctx context.Context, name string, caps []model.C
 		return nil, nil, nil, fmt.Errorf("%s %w", name, err)
 	}
 
+	// Deprecated runner override option; ignore if present.
+	delete(requestOpts, "use_imagegen_runner")
+
 	opts, err := s.modelOptions(model, requestOpts)
 	if err != nil {
 		return nil, nil, nil, err
@@ -205,13 +219,21 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		return
 	}
 
-	name := model.ParseName(req.Model)
-	if !name.IsValid() {
-		// Ideally this is "invalid model name" but we're keeping with
-		// what the API currently returns until we can change it.
-		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found", req.Model)})
+	modelRef, err := parseAndValidateModelRef(req.Model)
+	if err != nil {
+		writeModelRefParseError(c, err, http.StatusNotFound, fmt.Sprintf("model '%s' not found", req.Model))
 		return
 	}
+
+	if modelRef.Source == modelSourceCloud {
+		// TODO(drifkin): evaluate an `/api/*` passthrough for cloud where the
+		// original body (modulo model name normalization) is sent to cloud.
+		req.Model = modelRef.Base
+		proxyCloudJSONRequest(c, req, cloudErrRemoteInferenceUnavailable)
+		return
+	}
+
+	name := modelRef.Name
 
 	resolvedName, _, err := s.resolveAlias(name)
 	if err != nil {
@@ -243,6 +265,11 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 
 	if req.TopLogprobs < 0 || req.TopLogprobs > 20 {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "top_logprobs must be between 0 and 20"})
+		return
+	}
+
+	if modelRef.Source == modelSourceLocal && m.Config.RemoteHost != "" && m.Config.RemoteModel != "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found", req.Model)})
 		return
 	}
 
@@ -380,12 +407,6 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		}
 	}
 
-	// Validate Think value: string values currently only allowed for harmony/gptoss models
-	if req.Think != nil && req.Think.IsString() && m.Config.Parser != "harmony" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("think value %q is not supported for this model", req.Think.String())})
-		return
-	}
-
 	caps := []model.Capability{model.CapabilityCompletion}
 	if req.Suffix != "" {
 		caps = append(caps, model.CapabilityInsert)
@@ -494,7 +515,8 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		// the real chat handler, but doing this as a stopgap to get renderer
 		// support for generate
 		if values.Messages != nil && values.Suffix == "" && req.Template == "" {
-			prompt, images, err = chatPrompt(c.Request.Context(), m, r.Tokenize, opts, values.Messages, nil, req.Think, req.Truncate == nil || *req.Truncate)
+			genTruncate := (req.Truncate == nil || *req.Truncate) && !m.IsMLX()
+			prompt, images, err = chatPrompt(c.Request.Context(), m, r.Tokenize, opts, values.Messages, nil, req.Think, genTruncate)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
@@ -682,6 +704,18 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		return
 	}
 
+	modelRef, err := parseAndValidateModelRef(req.Model)
+	if err != nil {
+		writeModelRefParseError(c, err, http.StatusNotFound, fmt.Sprintf("model '%s' not found", req.Model))
+		return
+	}
+
+	if modelRef.Source == modelSourceCloud {
+		req.Model = modelRef.Base
+		proxyCloudJSONRequest(c, req, cloudErrRemoteInferenceUnavailable)
+		return
+	}
+
 	var input []string
 
 	switch i := req.Input.(type) {
@@ -704,7 +738,7 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		}
 	}
 
-	name, err := getExistingName(model.ParseName(req.Model))
+	name, err := getExistingName(modelRef.Name)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found", req.Model)})
 		return
@@ -851,11 +885,19 @@ func (s *Server) EmbeddingsHandler(c *gin.Context) {
 		return
 	}
 
-	name := model.ParseName(req.Model)
-	if !name.IsValid() {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "model is required"})
+	modelRef, err := parseAndValidateModelRef(req.Model)
+	if err != nil {
+		writeModelRefParseError(c, err, http.StatusBadRequest, "model is required")
 		return
 	}
+
+	if modelRef.Source == modelSourceCloud {
+		req.Model = modelRef.Base
+		proxyCloudJSONRequest(c, req, cloudErrRemoteInferenceUnavailable)
+		return
+	}
+
+	name := modelRef.Name
 
 	r, _, _, err := s.scheduleRunner(c.Request.Context(), name.String(), []model.Capability{}, req.Options, req.KeepAlive)
 	if err != nil {
@@ -898,11 +940,18 @@ func (s *Server) PullHandler(c *gin.Context) {
 		return
 	}
 
-	name := model.ParseName(cmp.Or(req.Model, req.Name))
-	if !name.IsValid() {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": errtypes.InvalidModelNameErrMsg})
+	// TEMP(drifkin): we're temporarily allowing to continue pulling cloud model
+	// stub-files until we integrate cloud models into `/api/tags` (in which case
+	// this roundabout way of "adding" cloud models won't be needed anymore). So
+	// right here normalize any `:cloud` models into the legacy-style suffixes
+	// `:<tag>-cloud` and `:cloud`
+	modelRef, err := parseNormalizePullModelRef(cmp.Or(req.Model, req.Name))
+	if err != nil {
+		writeModelRefParseError(c, err, http.StatusBadRequest, errtypes.InvalidModelNameErrMsg)
 		return
 	}
+
+	name := modelRef.Name
 
 	name, err = getExistingName(name)
 	if err != nil {
@@ -1030,13 +1079,20 @@ func (s *Server) DeleteHandler(c *gin.Context) {
 		return
 	}
 
-	n := model.ParseName(cmp.Or(r.Model, r.Name))
-	if !n.IsValid() {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("name %q is invalid", cmp.Or(r.Model, r.Name))})
+	modelRef, err := parseNormalizePullModelRef(cmp.Or(r.Model, r.Name))
+	if err != nil {
+		switch {
+		case errors.Is(err, errConflictingModelSource):
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		case errors.Is(err, model.ErrUnqualifiedName):
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("name %q is invalid", cmp.Or(r.Model, r.Name))})
+		default:
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		}
 		return
 	}
 
-	n, err := getExistingName(n)
+	n, err := getExistingName(modelRef.Name)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found", cmp.Or(r.Model, r.Name))})
 		return
@@ -1085,6 +1141,20 @@ func (s *Server) ShowHandler(c *gin.Context) {
 		return
 	}
 
+	modelRef, err := parseAndValidateModelRef(req.Model)
+	if err != nil {
+		writeModelRefParseError(c, err, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if modelRef.Source == modelSourceCloud {
+		req.Model = modelRef.Base
+		proxyCloudJSONRequest(c, req, cloudErrRemoteModelDetailsUnavailable)
+		return
+	}
+
+	req.Model = modelRef.Base
+
 	resp, err := GetModelInfo(req)
 	if err != nil {
 		var statusErr api.StatusError
@@ -1098,6 +1168,11 @@ func (s *Server) ShowHandler(c *gin.Context) {
 		default:
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		}
+		return
+	}
+
+	if modelRef.Source == modelSourceLocal && resp.RemoteHost != "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found", modelRef.Original)})
 		return
 	}
 
@@ -1642,18 +1717,20 @@ func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
 	r.POST("/api/embeddings", s.EmbeddingsHandler)
 
 	// Inference (OpenAI compatibility)
-	r.POST("/v1/chat/completions", middleware.ChatMiddleware(), s.ChatHandler)
-	r.POST("/v1/completions", middleware.CompletionsMiddleware(), s.GenerateHandler)
-	r.POST("/v1/embeddings", middleware.EmbeddingsMiddleware(), s.EmbedHandler)
+	// TODO(cloud-stage-a): apply Modelfile overlay deltas for local models with cloud
+	// parents on v1 request families while preserving this explicit :cloud passthrough.
+	r.POST("/v1/chat/completions", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.ChatMiddleware(), s.ChatHandler)
+	r.POST("/v1/completions", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.CompletionsMiddleware(), s.GenerateHandler)
+	r.POST("/v1/embeddings", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.EmbeddingsMiddleware(), s.EmbedHandler)
 	r.GET("/v1/models", middleware.ListMiddleware(), s.ListHandler)
-	r.GET("/v1/models/:model", middleware.RetrieveMiddleware(), s.ShowHandler)
-	r.POST("/v1/responses", middleware.ResponsesMiddleware(), s.ChatHandler)
+	r.GET("/v1/models/:model", cloudModelPathPassthroughMiddleware(cloudErrRemoteModelDetailsUnavailable), middleware.RetrieveMiddleware(), s.ShowHandler)
+	r.POST("/v1/responses", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.ResponsesMiddleware(), s.ChatHandler)
 	// OpenAI-compatible image generation endpoints
-	r.POST("/v1/images/generations", middleware.ImageGenerationsMiddleware(), s.GenerateHandler)
-	r.POST("/v1/images/edits", middleware.ImageEditsMiddleware(), s.GenerateHandler)
+	r.POST("/v1/images/generations", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.ImageGenerationsMiddleware(), s.GenerateHandler)
+	r.POST("/v1/images/edits", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.ImageEditsMiddleware(), s.GenerateHandler)
 
 	// Inference (Anthropic compatibility)
-	r.POST("/v1/messages", middleware.AnthropicMessagesMiddleware(), s.ChatHandler)
+	r.POST("/v1/messages", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.AnthropicMessagesMiddleware(), s.ChatHandler)
 
 	if rc != nil {
 		// wrap old with new
@@ -1963,6 +2040,9 @@ func (s *Server) PsHandler(c *gin.Context) {
 		}
 		if v.llama != nil {
 			mr.ContextLength = v.llama.ContextLength()
+			total, vram := v.llama.MemorySize()
+			mr.Size = int64(total)
+			mr.SizeVRAM = int64(vram)
 		}
 		// The scheduler waits to set expiresAt, so if a model is loading it's
 		// possible that it will be set to the unix epoch. For those cases, just
@@ -2285,11 +2365,23 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		req.TaskID = uuid.New().String()
 	}
 
-	name := model.ParseName(req.Model)
-	if !name.IsValid() {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "model is required"})
+	modelRef, err := parseAndValidateModelRef(req.Model)
+	if err != nil {
+		writeModelRefParseError(c, err, http.StatusBadRequest, "model is required")
 		return
 	}
+
+	if modelRef.Source == modelSourceCloud {
+		req.Model = modelRef.Base
+		if c.GetBool(legacyCloudAnthropicKey) {
+			proxyCloudJSONRequestWithPath(c, req, "/api/chat", cloudErrRemoteInferenceUnavailable)
+			return
+		}
+		proxyCloudJSONRequest(c, req, cloudErrRemoteInferenceUnavailable)
+		return
+	}
+
+	name := modelRef.Name
 
 	resolvedName, _, err := s.resolveAlias(name)
 	if err != nil {
@@ -2319,6 +2411,11 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 	if req.TopLogprobs < 0 || req.TopLogprobs > 20 {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "top_logprobs must be between 0 and 20"})
+		return
+	}
+
+	if modelRef.Source == modelSourceLocal && m.Config.RemoteHost != "" && m.Config.RemoteModel != "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found", req.Model)})
 		return
 	}
 
@@ -2576,6 +2673,9 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	}
 
 	truncate := req.Truncate == nil || *req.Truncate
+	if m.IsMLX() {
+		truncate = false
+	}
 	prompt, images, err := chatPrompt(c.Request.Context(), m, r.Tokenize, opts, msgs, processedTools, req.Think, truncate)
 	if err != nil {
 		slog.Error("chat prompt error", "error", err)
@@ -2595,12 +2695,6 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				ImageCount:       len(images),
 			},
 		})
-		return
-	}
-
-	// Validate Think value: string values currently only allowed for harmony/gptoss models
-	if req.Think != nil && req.Think.IsString() && m.Config.Parser != "harmony" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("think value %q is not supported for this model", req.Think.String())})
 		return
 	}
 

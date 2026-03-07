@@ -491,8 +491,11 @@ func runMCPToolLoop(p MCPToolLoopParams) {
 			}
 		}
 
-		// Execute completion — always suppress Done during the loop
-		suppressDone := true
+		// Suppress Done during intermediate MCP rounds so the client doesn't
+		// see a premature finish. When there is no MCP manager the loop runs
+		// at most once and tool calls are returned to the client, so Done
+		// must flow through normally.
+		suppressDone := p.MCPManager != nil
 		slog.Debug("Calling executeCompletionWithTools", "round", round, "prompt_len", len(prompt), "suppress_done", suppressDone, "suppress_streaming", retryingFailedToolCall)
 		completionResult, err := p.Server.executeCompletionWithTools(
 			p.Ctx,
@@ -525,7 +528,10 @@ func runMCPToolLoop(p MCPToolLoopParams) {
 
 		// Check if model called tools
 		if len(completionResult.ToolCalls) == 0 {
-			if looksLikeFailedToolCall(completionResult.Content) {
+			// Only retry malformed tool calls for MCP requests where the
+			// server handles execution.  For non-MCP (e.g. Claude Code)
+			// the client owns tool execution, so just return the content.
+			if p.MCPManager != nil && looksLikeFailedToolCall(completionResult.Content) {
 				slog.Warn("Detected failed tool call attempt, re-prompting",
 					"round", round,
 					"content", completionResult.Content)
@@ -566,7 +572,10 @@ func runMCPToolLoop(p MCPToolLoopParams) {
 		if p.MCPManager != nil {
 			executeMCPToolCalls(p, completionResult, &currentMsgs, &processedTools, round)
 		} else {
-			executeNoMCPFallback(p, completionResult, &currentMsgs, round)
+			// No MCP manager: tool calls are meant for the client (e.g. Claude Code).
+			// Break out so they are returned via the stream as-is.
+			slog.Info("Tool calls detected without MCP manager, returning to client", "round", round, "tool_count", len(completionResult.ToolCalls))
+			break
 		}
 	}
 
@@ -576,15 +585,19 @@ func runMCPToolLoop(p MCPToolLoopParams) {
 		p.Ch <- gin.H{"error": fmt.Sprintf("Maximum tool execution rounds (%d) exceeded", maxRounds)}
 	}
 
-	// Send final Done: true
-	p.Ch <- api.ChatResponse{
-		Model:      p.Req.Model,
-		CreatedAt:  time.Now().UTC(),
-		Message:    api.Message{Role: "assistant"},
-		Done:       true,
-		DoneReason: "stop",
-		TaskID:     p.Req.TaskID,
-		TaskStatus: "completed",
+	// For MCP requests the individual rounds suppress Done, so we need an
+	// explicit final signal.  Non-MCP requests already sent Done: true via
+	// executeCompletionWithTools, so skip to avoid a duplicate empty chunk.
+	if p.MCPManager != nil {
+		p.Ch <- api.ChatResponse{
+			Model:      p.Req.Model,
+			CreatedAt:  time.Now().UTC(),
+			Message:    api.Message{Role: "assistant"},
+			Done:       true,
+			DoneReason: "stop",
+			TaskID:     p.Req.TaskID,
+			TaskStatus: "completed",
+		}
 	}
 }
 
@@ -820,57 +833,6 @@ func executeMCPToolCalls(
 		"round", round,
 		"messages", len(*currentMsgs),
 		"last_tool", regularToolCalls[len(regularToolCalls)-1].Function.Name)
-}
-
-// ---------------------------------------------------------------------------
-// executeNoMCPFallback — tool calls without an MCP manager
-// ---------------------------------------------------------------------------
-
-func executeNoMCPFallback(
-	p MCPToolLoopParams,
-	completionResult *CompletionResult,
-	currentMsgs *[]api.Message,
-	round int,
-) {
-	slog.Warn("Tool calls made but no MCP manager available", "round", round, "tool_count", len(completionResult.ToolCalls))
-
-	var errorResults []api.ToolResult
-	for _, tc := range completionResult.ToolCalls {
-		errorResults = append(errorResults, api.ToolResult{
-			ToolName:  tc.Function.Name,
-			Arguments: tc.Function.Arguments,
-			Error:     fmt.Sprintf("Tool '%s' is not available. No MCP servers are configured.", tc.Function.Name),
-		})
-	}
-
-	if len(errorResults) > 0 {
-		p.Ch <- api.ChatResponse{
-			Model:      p.Req.Model,
-			TaskID:     p.Req.TaskID,
-			TaskStatus: "working",
-			Message: api.Message{
-				Role:        "assistant",
-				ToolCalls:   completionResult.ToolCalls,
-				ToolResults: errorResults,
-			},
-		}
-	}
-
-	*currentMsgs = append(*currentMsgs, api.Message{
-		Role:      "assistant",
-		Content:   completionResult.Content,
-		ToolCalls: completionResult.ToolCalls,
-	})
-
-	for _, result := range errorResults {
-		*currentMsgs = append(*currentMsgs, api.Message{
-			Role:     "tool",
-			ToolName: result.ToolName,
-			Content:  fmt.Sprintf("Error: %s", result.Error),
-		})
-	}
-
-	slog.Info("Tool errors fed back to model, continuing", "round", round)
 }
 
 // ---------------------------------------------------------------------------

@@ -31,10 +31,11 @@ const (
 )
 
 type Qwen3CoderParser struct {
-	state     qwenParserState
-	acc       strings.Builder
-	tools     []api.Tool
-	callIndex int
+	state          qwenParserState
+	acc            strings.Builder
+	tools          []api.Tool
+	callIndex      int
+	bareFunction   bool // true when tool content entered via bare <function= (no <tool_call> wrapper)
 }
 
 func (p *Qwen3CoderParser) HasToolSupport() bool {
@@ -143,6 +144,7 @@ func eat(p *Qwen3CoderParser) ([]qwenEvent, bool) {
 			after := split[1]
 			p.acc.Reset()
 			p.acc.WriteString(after)
+			p.bareFunction = false
 			p.state = qwenParserState_CollectingToolContent
 			return events, true
 		} else if strings.Contains(p.acc.String(), functionOpenTag) {
@@ -157,6 +159,7 @@ func eat(p *Qwen3CoderParser) ([]qwenEvent, bool) {
 			after := p.acc.String()[idx:]
 			p.acc.Reset()
 			p.acc.WriteString(after)
+			p.bareFunction = true
 			p.state = qwenParserState_CollectingToolContent
 			return events, true
 		} else if toolOverlap := overlap(p.acc.String(), toolOpenTag); toolOverlap > 0 {
@@ -216,21 +219,14 @@ func eat(p *Qwen3CoderParser) ([]qwenEvent, bool) {
 			events = append(events, qwenEventRawToolCall{raw: before})
 			p.state = qwenParserState_LookingForToolStart
 			return events, true
-		} else if strings.Contains(p.acc.String(), functionCloseTag) {
-			// Fallback: handle bare </function> without </tool_call> wrapper
-			// Extract just the function content
+		} else if p.bareFunction && strings.Contains(p.acc.String(), functionCloseTag) {
+			// Only use </function> as close tag when we entered via bare <function=
+			// (no <tool_call> wrapper). Otherwise wait for </tool_call>.
 			split := strings.SplitN(p.acc.String(), functionCloseTag, 2)
 			before := split[0] + functionCloseTag // Include the closing tag for parsing
-			// Check for trailing </tool_call> and skip it
-			after := split[1]
-			after = strings.TrimLeftFunc(after, unicode.IsSpace)
-			if strings.HasPrefix(after, toolCloseTag) {
-				after = strings.TrimPrefix(after, toolCloseTag)
-				after = strings.TrimLeftFunc(after, unicode.IsSpace)
-			}
+			after := strings.TrimLeftFunc(split[1], unicode.IsSpace)
 			p.acc.Reset()
 			p.acc.WriteString(after)
-			// The raw content includes <function=...>...</function>
 			events = append(events, qwenEventRawToolCall{raw: before})
 			p.state = qwenParserState_LookingForToolStart
 			return events, true

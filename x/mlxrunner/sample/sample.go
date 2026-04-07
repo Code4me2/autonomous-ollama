@@ -1,5 +1,3 @@
-//go:build mlx
-
 package sample
 
 import (
@@ -171,7 +169,7 @@ func topK(s *Sampler, logprobs *mlx.Array) *mlx.Array {
 		return logprobs
 	}
 
-	mask := logprobs.Negative().ArgpartitionAxis(s.TopK-1, -1).Slice(mlx.Slice(), mlx.Slice(s.TopK, 0))
+	mask := logprobs.Negative().ArgpartitionAxis(s.TopK-1, -1).Slice(mlx.Slice(), mlx.Slice(s.TopK, mlx.End))
 	return logprobs.PutAlongAxis(mask, mlx.FromValue(float32(math.Inf(-1))), -1)
 }
 

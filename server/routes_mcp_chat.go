@@ -453,6 +453,14 @@ func runMCPToolLoop(p MCPToolLoopParams) {
 	var retryingFailedToolCall bool
 
 	for round = 0; round < maxRounds; round++ {
+		// Stop if client disconnected (context cancelled by Gin on HTTP close)
+		select {
+		case <-p.Ctx.Done():
+			slog.Info("MCP tool loop cancelled (client disconnect)", "round", round)
+			return
+		default:
+		}
+
 		slog.Debug("Starting tool round", "round", round, "messages", len(currentMsgs), "tools", len(processedTools))
 
 		// Re-render prompt and reset parser if not first round (tool results were added)
@@ -571,6 +579,14 @@ func runMCPToolLoop(p MCPToolLoopParams) {
 		// Model called tools — execute them
 		if p.MCPManager != nil {
 			executeMCPToolCalls(p, completionResult, &currentMsgs, &processedTools, round)
+
+			// Check again after tool execution (can be slow for remote MCP)
+			select {
+			case <-p.Ctx.Done():
+				slog.Info("MCP tool loop cancelled after tool execution", "round", round)
+				return
+			default:
+			}
 		} else {
 			// No MCP manager: tool calls are meant for the client (e.g. Claude Code).
 			// Break out so they are returned via the stream as-is.

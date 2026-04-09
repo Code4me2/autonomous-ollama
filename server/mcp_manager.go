@@ -787,37 +787,63 @@ func (m *MCPManager) HandleDiscovery(pattern string) (string, error) {
 
 // HandleListTools processes an mcp_list_tools call and returns tool schemas from requested servers.
 // This is tier 2 of the two-tier discovery: it returns actual tool definitions.
+// Connects to all requested servers concurrently with a per-server timeout.
 func (m *MCPManager) HandleListTools(serverNames []string) ([]api.Tool, string, error) {
+	// Phase 1: Connect and fetch tools from all servers concurrently
+	type listToolsResult struct {
+		name  string
+		tools []api.Tool
+		err   error
+	}
+
+	results := make(chan listToolsResult, len(serverNames))
+	for _, name := range serverNames {
+		go func(serverName string) {
+			done := make(chan listToolsResult, 1)
+			go func() {
+				if err := m.EnsureConnected(serverName); err != nil {
+					done <- listToolsResult{name: serverName, err: fmt.Errorf("connection failed: %w", err)}
+					return
+				}
+				tools, err := m.GetToolsFromServer(serverName)
+				if err != nil {
+					done <- listToolsResult{name: serverName, err: fmt.Errorf("failed to list tools: %w", err)}
+					return
+				}
+				done <- listToolsResult{name: serverName, tools: tools}
+			}()
+
+			select {
+			case r := <-done:
+				results <- r
+			case <-time.After(5 * time.Second):
+				slog.Warn("JIT: Server list_tools timed out (5s)", "server", serverName)
+				results <- listToolsResult{name: serverName, err: fmt.Errorf("timeout (5s)")}
+			}
+		}(name)
+	}
+
+	// Phase 2: Collect results and process sequentially (tool caching, routing, summary)
 	var allNewTools []api.Tool
 	var summaryParts []string
 
-	for _, serverName := range serverNames {
-		// Ensure connected
-		if err := m.EnsureConnected(serverName); err != nil {
-			summaryParts = append(summaryParts,
-				fmt.Sprintf("- %s: connection failed: %v", serverName, err))
-			continue
-		}
+	for range serverNames {
+		r := <-results
 
-		// Get tools from this server
-		tools, err := m.GetToolsFromServer(serverName)
-		if err != nil {
+		if r.err != nil {
 			summaryParts = append(summaryParts,
-				fmt.Sprintf("- %s: failed to list tools: %v", serverName, err))
+				fmt.Sprintf("- %s: %v", r.name, r.err))
 			continue
 		}
 
 		// Cache tools
 		m.mu.Lock()
-		m.allToolsCache[serverName] = tools
+		m.allToolsCache[r.name] = r.tools
 		m.mu.Unlock()
 
 		// Filter out already-discovered tools, apply per-server limit
 		var newTools []api.Tool
-		var toolNames []string
-		for _, tool := range tools {
-			toolNames = append(toolNames, tool.Function.Name)
-
+		for _, tool := range r.tools {
 			m.mu.RLock()
 			_, alreadyDiscovered := m.discoveredTools[tool.Function.Name]
 			m.mu.RUnlock()
@@ -834,7 +860,7 @@ func (m *MCPManager) HandleListTools(serverNames []string) ([]api.Tool, string, 
 		m.mu.Lock()
 		for _, tool := range newTools {
 			m.discoveredTools[tool.Function.Name] = tool
-			m.toolRouting[tool.Function.Name] = serverName
+			m.toolRouting[tool.Function.Name] = r.name
 		}
 		m.mu.Unlock()
 
@@ -851,9 +877,9 @@ func (m *MCPManager) HandleListTools(serverNames []string) ([]api.Tool, string, 
 				fmt.Sprintf("  - %s: %s", tool.Function.Name, desc))
 		}
 
-		alreadyKnown := len(tools) - len(newTools)
+		alreadyKnown := len(r.tools) - len(newTools)
 		serverSummary := fmt.Sprintf("- %s (%d new tools):\n%s",
-			serverName, len(newTools), strings.Join(toolDescParts, "\n"))
+			r.name, len(newTools), strings.Join(toolDescParts, "\n"))
 		if alreadyKnown > 0 {
 			serverSummary += fmt.Sprintf("\n  (%d tools already loaded)", alreadyKnown)
 		}

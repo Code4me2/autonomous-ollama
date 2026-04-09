@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ollama/ollama/api"
 )
@@ -686,41 +687,71 @@ func (m *MCPManager) BuildServerCatalog(pattern string) []ServerCatalogEntry {
 	}
 	sort.Strings(sortedNames)
 
-	var catalog []ServerCatalogEntry
-
+	// Filter by pattern first
+	var matchedNames []string
 	for _, name := range sortedNames {
-		// Match pattern against server name
-		if !MatchToolPattern(pattern, name) {
-			continue
+		if MatchToolPattern(pattern, name) {
+			matchedNames = append(matchedNames, name)
 		}
+	}
 
-		// Lazily connect to get tool count
-		toolCount, err := m.ensureConnectedUnlocked(name)
-		if err != nil {
-			slog.Warn("JIT: Failed to connect to server for catalog",
-				"server", name, "error", err)
-			// Still include it with 0 tools so model knows it exists
-			m.mu.RLock()
-			desc := m.resolveServerDescription(name)
-			m.mu.RUnlock()
-			catalog = append(catalog, ServerCatalogEntry{
-				Name:        name,
-				Description: desc + " (connection failed)",
-				ToolCount:   0,
-			})
-			continue
-		}
+	// Connect to all servers concurrently with a per-server timeout
+	type catalogResult struct {
+		name      string
+		toolCount int
+		err       error
+	}
 
+	results := make(chan catalogResult, len(matchedNames))
+	for _, name := range matchedNames {
+		go func(serverName string) {
+			// Per-server timeout: 5 seconds
+			done := make(chan catalogResult, 1)
+			go func() {
+				toolCount, err := m.ensureConnectedUnlocked(serverName)
+				done <- catalogResult{name: serverName, toolCount: toolCount, err: err}
+			}()
+
+			select {
+			case r := <-done:
+				results <- r
+			case <-time.After(5 * time.Second):
+				slog.Warn("JIT: Server discovery timed out (5s)",
+					"server", serverName)
+				results <- catalogResult{name: serverName, toolCount: 0, err: fmt.Errorf("timeout")}
+			}
+		}(name)
+	}
+
+	// Collect results
+	var catalog []ServerCatalogEntry
+	for range matchedNames {
+		r := <-results
 		m.mu.RLock()
-		desc := m.resolveServerDescription(name)
+		desc := m.resolveServerDescription(r.name)
 		m.mu.RUnlock()
 
-		catalog = append(catalog, ServerCatalogEntry{
-			Name:        name,
-			Description: desc,
-			ToolCount:   toolCount,
-		})
+		if r.err != nil {
+			slog.Warn("JIT: Failed to connect to server for catalog",
+				"server", r.name, "error", r.err)
+			catalog = append(catalog, ServerCatalogEntry{
+				Name:        r.name,
+				Description: desc + " (unavailable)",
+				ToolCount:   0,
+			})
+		} else {
+			catalog = append(catalog, ServerCatalogEntry{
+				Name:        r.name,
+				Description: desc,
+				ToolCount:   r.toolCount,
+			})
+		}
 	}
+
+	// Sort catalog to maintain deterministic order
+	sort.Slice(catalog, func(i, j int) bool {
+		return catalog[i].Name < catalog[j].Name
+	})
 
 	return catalog
 }
